@@ -9,6 +9,34 @@ logger = logging.getLogger("CPPMQueries")
 class ResourceNotFound(Exception):
     pass
 
+
+def _nas_name(s: dict) -> str:
+    """NAS device name for a ClearPass ``/api/session`` record.
+
+    ClearPass's documented field is ``nas_name`` (with the underscore); older or
+    variant deployments may expose ``nasname`` / ``nasidentifier``. Fall back to
+    the NAS IP (``nasipaddress``) when no name is present so the Access Tracker
+    still shows which network device the session terminated on."""
+    return (s.get("nas_name") or s.get("nasname") or s.get("nasidentifier")
+            or s.get("nas_identifier") or s.get("nas-identifier")
+            or s.get("nasipaddress") or "")
+
+
+def _nas_port(s: dict) -> str:
+    """NAS port identifier for a ClearPass ``/api/session`` record.
+
+    ClearPass carries the port in ``nasportid`` (e.g. "Ethernet1/0/12"); there
+    is no ``nasport`` field. Returns '' when the session has no port info
+    (e.g. a wireless controller session), so the UI can show '—'."""
+    return (s.get("nasportid") or s.get("nas_port_id")
+            or s.get("nasport") or s.get("nas_port") or "")
+
+
+def _nas_port_type(s: dict) -> str:
+    """NAS port type (e.g. 'Ethernet', 'Wireless - IEEE 802.11') if reported."""
+    return s.get("nasporttype") or s.get("nas_port_type") or ""
+
+
 class CPPMQueries:
     """
     High-level interface for querying ClearPass Policy Manager.
@@ -89,9 +117,6 @@ class CPPMQueries:
 
         sessions = []
         for s in items:
-            # NAS name: CPPM may use nasname, nasidentifier, or nas_identifier
-            nas = (s.get("nasname") or s.get("nasidentifier") or
-                   s.get("nas_identifier") or s.get("nas-identifier") or "")
             # Role: may be a list or a single string
             roles_raw = s.get("roles") or s.get("role") or ""
             role = roles_raw[0] if isinstance(roles_raw, list) and roles_raw else (roles_raw if isinstance(roles_raw, str) else "")
@@ -103,7 +128,9 @@ class CPPMQueries:
                 "mac":              s.get("callingstation", s.get("mac", "")),
                 "ip":               s.get("framedipaddress", ""),
                 "calling_station":  s.get("callingstation", ""),
-                "nas_name":         nas,
+                "nas_name":         _nas_name(s),
+                "nas_port":         _nas_port(s),
+                "nas_port_type":    _nas_port_type(s),
                 "role":             role,
                 "service":          svc,
                 "start_time":       _iso(s.get("acctstarttime", "")),
@@ -447,8 +474,6 @@ class CPPMQueries:
 
         sessions = []
         for s in items:
-            nas = (s.get("nasname") or s.get("nasidentifier") or
-                   s.get("nas_identifier") or s.get("nas-identifier") or "")
             roles_raw = s.get("roles") or s.get("role") or ""
             role = roles_raw[0] if isinstance(roles_raw, list) and roles_raw else (roles_raw if isinstance(roles_raw, str) else "")
             svc = s.get("service") or s.get("servicename") or s.get("service_name") or ""
@@ -456,7 +481,9 @@ class CPPMQueries:
                 "id":        s.get("id", ""),
                 "username":  s.get("username", ""),
                 "ip":        s.get("framedipaddress", ""),
-                "nas_name":  nas,
+                "nas_name":  _nas_name(s),
+                "nas_port":  _nas_port(s),
+                "nas_port_type": _nas_port_type(s),
                 "role":      role,
                 "service":   svc,
                 "start_time": _iso(s.get("acctstarttime", "")),
@@ -593,7 +620,7 @@ class CPPMQueries:
                         s.get("username", ""),
                         s.get("framedipaddress", ""),
                         s.get("callingstation", ""),
-                        s.get("nasname", ""),
+                        _nas_name(s),
                     ]
                     roles = s.get("roles")
                     if isinstance(roles, list):
@@ -613,7 +640,7 @@ class CPPMQueries:
                         "name":     s.get("username", ""),
                         "ip":       s.get("framedipaddress", ""),
                         "mac":      s.get("callingstation", ""),
-                        "nas":      s.get("nasname", ""),
+                        "nas":      _nas_name(s),
                         "role":     (roles or [""])[0] if isinstance(roles, list) else s.get("role", ""),
                         "id":       s.get("id", ""),
                     })
