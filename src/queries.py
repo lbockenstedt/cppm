@@ -1,0 +1,646 @@
+from typing import Any, Dict, List, Optional
+from client import CPPMClient
+import json
+import logging
+import re
+
+logger = logging.getLogger("CPPMQueries")
+
+class ResourceNotFound(Exception):
+    pass
+
+class CPPMQueries:
+    """
+    High-level interface for querying ClearPass Policy Manager.
+    """
+    # Tenant tag stored as endpoint attributes — the SAME names the at-auth-time
+    # Context Server Action (lm/clearpass/netbox-tenant-context-server-action.json)
+    # populates as Authorization attributes, so an Enforcement Policy can match
+    # the tenant whether it was resolved ahead-of-time (this sync, via MAC lookup)
+    # or at auth time (the CSA, via the endpoint's IP).
+    TENANT_ATTR_SLUG = "NetBox_Tenant_Slug"
+    TENANT_ATTR_NAME = "NetBox_Tenant_Name"
+    TENANT_ATTR_ID = "NetBox_Tenant_ID"
+    # Human-readable tenant attributes (value pulled from NetBox via the hub
+    # payload): the friendly name and the machine slug. These sit alongside the
+    # NetBox_Tenant_* tags so ClearPass Device Inventory shows a plain "Tenant"
+    # column and an enforcement policy can match on either a friendly label or
+    # the CSA's slug.
+    TENANT_ATTR_TENANT = "Tenant"
+    TENANT_ATTR_TENANT_SLUG = "Tenant_Slug"
+
+    # Upper bound on how many endpoints the substring search scans. ClearPass's
+    # REST `filter` only supports exact-equality (no SQL-LIKE), so partial match
+    # is done client-side over a bounded paged scan of the inventory. Active
+    # sessions are naturally bounded so they scan fully. Tuned for the global
+    # search dropdown's responsiveness; raise if a deployment needs deeper reach.
+    SEARCH_SCAN_CAP = 5000
+
+    def __init__(self, client: CPPMClient):
+        self.client = client
+
+    def _items(self, result: Any, key: str = "_embedded") -> List[Dict]:
+        """Extracts item list from CPPM's HAL-style response."""
+        if isinstance(result, dict):
+            if "status" in result and result["status"] == "ERROR":
+                return []
+            embedded = result.get("_embedded", {})
+            if embedded:
+                for v in embedded.values():
+                    if isinstance(v, list):
+                        return v
+            if "items" in result:
+                return result["items"]
+        elif isinstance(result, list):
+            return result
+        return []
+
+    # --- Access Tracker ---
+
+    def get_access_tracker(self, limit: int = 200, offset: int = 0) -> Dict[str, Any]:
+        """Active sessions only from the ClearPass Access Tracker.
+
+        ClearPass ``/api/session`` returns both active and closed sessions, so
+        without a filter the list (and ``count``) grows forever as history
+        accumulates. Active sessions have no ``acctstoptime`` — filtering on
+        ``{"acctstoptime": {"$exists": false}}`` returns only sessions that have
+        not closed out. (Filtering on ``state`` is known to 500 on ClearPass.)"""
+        active_filter = json.dumps({"acctstoptime": {"$exists": False}}, separators=(",", ":"))
+        result = self.client.query(
+            "/api/session",
+            params={
+                "calculate_count": "true",
+                "limit": limit,
+                "offset": offset,
+                "filter": active_filter,
+            },
+        )
+        _items_preview = result.get('_embedded', {}).get('items', []) if isinstance(result, dict) else []
+        logger.info(f"CPPM /api/session count={result.get('count') if isinstance(result, dict) else '?'} first_item={dict(list(_items_preview[0].items())[:20]) if _items_preview else '{}'}")
+        if isinstance(result, dict) and result.get("status") == "ERROR":
+            return result
+        items = self._items(result)
+
+        def _iso(dt):
+            """Convert CPPM datetime string to ISO 8601 so JS new Date() parses it reliably."""
+            if not dt:
+                return ""
+            return str(dt).strip().replace(" ", "T") if " " in str(dt) else str(dt)
+
+        sessions = []
+        for s in items:
+            # NAS name: CPPM may use nasname, nasidentifier, or nas_identifier
+            nas = (s.get("nasname") or s.get("nasidentifier") or
+                   s.get("nas_identifier") or s.get("nas-identifier") or "")
+            # Role: may be a list or a single string
+            roles_raw = s.get("roles") or s.get("role") or ""
+            role = roles_raw[0] if isinstance(roles_raw, list) and roles_raw else (roles_raw if isinstance(roles_raw, str) else "")
+            # Service: may be service or servicename
+            svc = s.get("service") or s.get("servicename") or s.get("service_name") or ""
+            sessions.append({
+                "id":               s.get("id", ""),
+                "username":         s.get("username", ""),
+                "mac":              s.get("callingstation", s.get("mac", "")),
+                "ip":               s.get("framedipaddress", ""),
+                "calling_station":  s.get("callingstation", ""),
+                "nas_name":         nas,
+                "role":             role,
+                "service":          svc,
+                "start_time":       _iso(s.get("acctstarttime", "")),
+                "state":            s.get("state", ""),
+                "acct_session_time": s.get("acctsessiontime", 0),
+            })
+        total = result.get("count", len(sessions)) if isinstance(result, dict) else len(sessions)
+        return {"status": "SUCCESS", "sessions": sessions, "total": total}
+
+    # --- Device Database ---
+
+    def get_device_database(self, limit: int = 200, offset: int = 0, status: Optional[str] = None) -> Dict[str, Any]:
+        """Endpoint (device) database from ClearPass."""
+        params: Dict[str, Any] = {
+            "calculate_count": "true",
+            "limit": limit,
+            "offset": offset,
+        }
+        if status:
+            params["filter"] = json.dumps({"status": status}, separators=(",", ":"))
+        result = self.client.query("/api/endpoint", params=params)
+        if isinstance(result, dict) and result.get("status") == "ERROR":
+            return result
+        items = self._items(result)
+        devices = []
+        for d in items:
+            attrs = d.get("attributes", {}) or {}
+            devices.append({
+                "id": d.get("id", ""),
+                "mac": d.get("mac_address", ""),
+                "status": d.get("status", ""),
+                "description": d.get("description", ""),
+                "device_vendor": attrs.get("Device Vendor", ""),
+                "device_os": attrs.get("Device OS", ""),
+                "device_type": attrs.get("Device Type", ""),
+                "hostname": attrs.get("Hostname", ""),
+                "ip": attrs.get("ip_address", attrs.get("IP Address", "")),
+                # Full attribute map (non-empty values) so the Device Database
+                # list can show endpoint attributes inline. The detail modal
+                # (GET_ENDPOINT_DETAIL) returns the same map for the click view.
+                "attributes": {k: v for k, v in attrs.items() if v},
+            })
+        total = result.get("count", len(devices)) if isinstance(result, dict) else len(devices)
+        return {"status": "SUCCESS", "devices": devices, "total": total}
+
+    # --- NAC Status Summary ---
+
+    def get_nac_status(self) -> Dict[str, Any]:
+        """Aggregate NAC health: active session count + device counts by status.
+
+        ``active_sessions`` counts only sessions that have not closed out (no
+        ``acctstoptime``); without this filter ClearPass returns every session
+        ever recorded and the count grows monotonically."""
+        active_filter = json.dumps({"acctstoptime": {"$exists": False}}, separators=(",", ":"))
+        sessions_result = self.client.query("/api/session", params={"calculate_count": "true", "limit": 1, "filter": active_filter})
+        devices_result = self.client.query("/api/endpoint", params={"calculate_count": "true", "limit": 1})
+        known_result = self.client.query(
+            "/api/endpoint",
+            params={"calculate_count": "true", "limit": 1, "filter": '{"status":"Known"}'},
+        )
+        unknown_result = self.client.query(
+            "/api/endpoint",
+            params={"calculate_count": "true", "limit": 1, "filter": '{"status":"Unknown"}'},
+        )
+        return {
+            "status": "SUCCESS",
+            "active_sessions": sessions_result.get("count", 0) if isinstance(sessions_result, dict) else 0,
+            "total_devices": devices_result.get("count", 0) if isinstance(devices_result, dict) else 0,
+            "known_devices": known_result.get("count", 0) if isinstance(known_result, dict) else 0,
+            "unknown_devices": unknown_result.get("count", 0) if isinstance(unknown_result, dict) else 0,
+        }
+
+    # --- Existing queries ---
+
+    def get_device_by_mac(self, mac: str) -> Optional[Dict[str, Any]]:
+        result = self.client.query("/api/endpoint", params={"filter": json.dumps({"mac_address": mac}, separators=(",", ":"))})
+        items = self._items(result)
+        return items[0] if items else None
+
+    def get_endpoint_detail(self, mac: str) -> Dict[str, Any]:
+        """Full endpoint record from ClearPass including all attributes."""
+        result = self.client.query("/api/endpoint", params={"filter": json.dumps({"mac_address": mac}, separators=(",", ":"))})
+        if isinstance(result, dict) and result.get("status") == "ERROR":
+            return result
+        items = self._items(result)
+        if not items:
+            return {"status": "ERROR", "message": "Endpoint not found"}
+        ep = items[0]
+        attrs = ep.get("attributes", {}) or {}
+        return {
+            "status": "SUCCESS",
+            "id": ep.get("id", ""),
+            "mac": ep.get("mac_address", ""),
+            "status_val": ep.get("status", ""),
+            "description": ep.get("description", ""),
+            "hostname": attrs.get("Hostname", attrs.get("hostname", "")),
+            "ip": attrs.get("IP Address", attrs.get("ip_address", attrs.get("ip", ""))),
+            "device_vendor": attrs.get("Device Vendor", attrs.get("device_vendor", "")),
+            "device_os": attrs.get("Device OS", attrs.get("device_os", "")),
+            "device_type": attrs.get("Device Type", attrs.get("device_type", "")),
+            "attributes": {k: v for k, v in attrs.items() if v},
+        }
+
+    # --- NetBox → ClearPass endpoint sync (CPPM_SYNC_ENDPOINTS) ---
+    # The hub owns the schedule and the batch; this spoke writes it into
+    # ClearPass Device Inventory. See lm/docs/modules/cppm.md §4 for the
+    # contract. The IPAM source is the source of truth: with replace=True the
+    # spoke upserts the batch AND removes endpoints previously tagged with this
+    # tenant that are absent from the batch. Best-effort — per-endpoint failures
+    # are counted, never raised.
+
+    @staticmethod
+    def _norm_mac(mac: str) -> str:
+        """Normalize a MAC to ClearPass's lowercase colon form (aa:bb:cc:dd:ee:ff)."""
+        m = (mac or "").strip().lower()
+        hexonly = re.sub(r"[^0-9a-f]", "", m)
+        if len(hexonly) == 12:
+            return ":".join(hexonly[i:i + 2] for i in range(0, 12, 2))
+        return m
+
+    def _get_endpoint_by_ip(self, ip: str) -> Optional[Dict[str, Any]]:
+        result = self.client.query("/api/endpoint", params={"filter": json.dumps({"ip_address": ip}, separators=(",", ":"))})
+        items = self._items(result)
+        return items[0] if items else None
+
+    def _upsert_endpoint(self, mac: str, ip: str, rec: Dict[str, Any],
+                         tenant_id: str, tenant_slug: str, tenant_name: str,
+                         source: str) -> str:
+        """Upsert one endpoint. Returns 'pushed' | 'skipped' | 'error'.
+
+        Keyed on MAC (authoritative); falls back to IP lookup when MAC is empty.
+        Existing endpoints are PUT-merged (so profiler-derived attributes are
+        preserved); new ones are POSTed. IP-only records with no existing
+        endpoint can't be created (ClearPass endpoints are MAC-keyed) → skipped.
+        """
+        hostname = (rec.get("hostname", "") or "").strip()
+        tag_attrs = {
+            self.TENANT_ATTR_SLUG: tenant_slug,
+            self.TENANT_ATTR_NAME: tenant_name,
+            self.TENANT_ATTR_ID: tenant_id,
+            self.TENANT_ATTR_TENANT: tenant_name,
+            self.TENANT_ATTR_TENANT_SLUG: tenant_slug,
+        }
+        if ip:
+            tag_attrs["IP Address"] = ip
+        if hostname:
+            tag_attrs["Hostname"] = hostname
+        description = f"Synced from {source} (tenant {tenant_slug})"
+
+        existing = None
+        if mac:
+            existing = self.get_device_by_mac(mac)
+        elif ip:
+            existing = self._get_endpoint_by_ip(ip)
+
+        if existing:
+            ep_id = existing.get("id")
+            if not ep_id:
+                return "error"
+            cur_attrs = dict(existing.get("attributes") or {})
+            cur_attrs.update(tag_attrs)
+            body: Dict[str, Any] = {"id": ep_id, "attributes": cur_attrs, "description": description}
+            if mac:
+                body["mac_address"] = mac
+            res = self.client._request("PUT", f"/api/endpoint/{ep_id}", json=body)
+            if isinstance(res, dict) and res.get("status") == "ERROR":
+                logger.warning("endpoint PUT %s failed: %s", ep_id, res.get("message"))
+                return "error"
+            return "pushed"
+
+        if not mac:
+            # No MAC and no existing endpoint to tag — nothing to attach to.
+            logger.info(
+                "endpoint sync SKIP: tenant=%s ip=%s hostname=%s mac=<empty> "
+                "— NetBox IP record has no mac_address custom field and no "
+                "existing ClearPass endpoint matched by ip_address; ClearPass "
+                "endpoints are MAC-keyed so an IP-only record cannot be created. "
+                "(If the device is already in ClearPass, ensure the NetBox IP "
+                "carries its MAC so the sync can merge by MAC.)",
+                tenant_slug, ip or "<empty>", hostname or "<empty>")
+            return "skipped"
+
+        body = {"mac_address": mac, "description": description,
+                "attributes": tag_attrs, "status": "Known"}
+        res = self.client._request("POST", "/api/endpoint", json=body)
+        if isinstance(res, dict) and res.get("status") == "ERROR":
+            logger.warning("endpoint POST %s failed: %s", mac, res.get("message"))
+            return "error"
+        return "pushed"
+
+    def _remove_absent_tagged(self, tenant_slug: str, batch_keys: set) -> int:
+        """Delete endpoints tagged with this tenant whose key is not in the batch.
+
+        Pages through /api/endpoint and filters client-side by the tenant
+        attribute (ClearPass's filter support for arbitrary attributes is
+        inconsistent across versions, so a client-side scan is the reliable
+        path). Returns the number deleted.
+        """
+        removed = 0
+        limit = 1000
+        offset = 0
+        while True:
+            res = self.client.query("/api/endpoint", params={
+                "limit": limit, "offset": offset, "calculate_count": "true"})
+            if isinstance(res, dict) and res.get("status") == "ERROR":
+                logger.warning("replace-scan list failed: %s", res.get("message"))
+                break
+            items = self._items(res)
+            if not items:
+                break
+            for ep in items:
+                attrs = ep.get("attributes") or {}
+                if attrs.get(self.TENANT_ATTR_SLUG) != tenant_slug:
+                    continue
+                mac = self._norm_mac(ep.get("mac_address", ""))
+                ip_val = attrs.get("IP Address") or attrs.get("ip_address") or ep.get("ip_address") or ""
+                ip = ip_val.strip() if isinstance(ip_val, str) else ""
+                key = mac or f"ip:{ip}"
+                if key in batch_keys:
+                    continue
+                ep_id = ep.get("id")
+                if not ep_id:
+                    continue
+                d = self.client._request("DELETE", f"/api/endpoint/{ep_id}")
+                if isinstance(d, dict) and d.get("status") != "ERROR":
+                    removed += 1
+                else:
+                    logger.warning("endpoint DELETE %s failed: %s", ep_id,
+                                   d.get("message") if isinstance(d, dict) else d)
+            count = res.get("count", 0) if isinstance(res, dict) else 0
+            offset += limit
+            if len(items) < limit or offset >= count:
+                break
+        return removed
+
+    def sync_endpoints(self, tenant_id: str, tenant_slug: str, tenant_name: str,
+                       source: str, endpoints: List[Dict[str, Any]],
+                       replace: bool = True) -> Dict[str, Any]:
+        """Sync a tenant's endpoint batch into ClearPass Device Inventory.
+
+        Upserts each endpoint (keyed on MAC, falling back to IP) tagged with the
+        tenant attributes so an Enforcement Policy can match the tenant the same
+        way the at-auth-time Context Server Action does. When replace=True, the
+        IPAM source is treated as the source of truth: endpoints previously
+        tagged with this tenant that are absent from the batch are deleted.
+
+        Returns {status, pushed, errors, skipped, removed, message}. The hub
+        reads status/pushed/errors/message; skipped/removed are extra detail.
+        """
+        tenant_slug = (tenant_slug or "").strip()
+        if not tenant_slug:
+            return {"status": "ERROR", "message": "Missing tenant_slug",
+                    "pushed": 0, "errors": 0, "skipped": 0, "removed": 0}
+        source = source or "IPAM"
+
+        batch: List[tuple] = []  # (key, mac, ip, rec)
+        batch_keys: set = set()
+        for rec in endpoints or []:
+            if not isinstance(rec, dict):
+                continue
+            mac = self._norm_mac(rec.get("mac", ""))
+            ip = (rec.get("ip", "") or "").strip()
+            if not mac and not ip:
+                continue
+            key = mac or f"ip:{ip}"
+            batch_keys.add(key)
+            batch.append((key, mac, ip, rec))
+
+        pushed = errors = skipped = 0
+        err_msgs: List[str] = []
+        skipped_details: List[Dict[str, Any]] = []
+        for key, mac, ip, rec in batch:
+            try:
+                outcome = self._upsert_endpoint(mac, ip, rec, tenant_id, tenant_slug, tenant_name, source)
+                if outcome == "pushed":
+                    pushed += 1
+                elif outcome == "skipped":
+                    skipped += 1
+                    # _upsert_endpoint already logged the per-record reason; capture
+                    # a concise detail so the hub can surface it in sync status.
+                    reason = ("no MAC on source record and no existing ClearPass "
+                              "endpoint matched by IP") if not mac else "skipped"
+                    skipped_details.append({
+                        "ip": ip or "", "mac": mac or "",
+                        "hostname": (rec.get("hostname", "") or "").strip(),
+                        "reason": reason,
+                    })
+                else:
+                    errors += 1
+            except Exception as e:
+                errors += 1
+                err_msgs.append(f"{key}: {e}")
+
+        removed = 0
+        if replace:
+            try:
+                removed = self._remove_absent_tagged(tenant_slug, batch_keys)
+            except Exception as e:
+                err_msgs.append(f"replace-scan: {e}")
+
+        if skipped_details:
+            logger.info(
+                "endpoint sync tenant=%s skipped %d record(s): %s",
+                tenant_slug, skipped,
+                "; ".join(f"ip={s['ip'] or '<empty>'} mac={s['mac'] or '<empty>'} "
+                          f"hostname={s['hostname'] or '<empty>'}" for s in skipped_details))
+
+        status = "SUCCESS" if errors == 0 else "ERROR"
+        msg = f"synced {pushed} from {source}"
+        if skipped:
+            msg += f", skipped {skipped}"
+            # Name the first couple of skipped IPs so the status card shows a hint
+            # without bloating the message for large batches.
+            names = [s["ip"] or s["hostname"] or "(no ip)" for s in skipped_details[:3]]
+            if names:
+                msg += " (" + ", ".join(names) + ")"
+        if replace:
+            msg += f", removed {removed} stale"
+        if err_msgs:
+            msg += " | errors: " + "; ".join(err_msgs[:8])
+        return {"status": status, "pushed": pushed, "errors": errors,
+                "skipped": skipped, "removed": removed, "message": msg,
+                "skipped_details": skipped_details}
+
+    def get_device_sessions(self, mac: str, limit: int = 20) -> Dict[str, Any]:
+        """Accounting sessions for a specific device by calling station (MAC address)."""
+        result = self.client.query(
+            "/api/session",
+            params={
+                "filter": json.dumps({"callingstation": mac}, separators=(",", ":")),
+                "limit": limit,
+                "calculate_count": "true",
+            },
+        )
+        if isinstance(result, dict) and result.get("status") == "ERROR":
+            return result
+        items = self._items(result)
+        def _iso(dt):
+            if not dt: return ""
+            return str(dt).strip().replace(" ", "T") if " " in str(dt) else str(dt)
+
+        sessions = []
+        for s in items:
+            nas = (s.get("nasname") or s.get("nasidentifier") or
+                   s.get("nas_identifier") or s.get("nas-identifier") or "")
+            roles_raw = s.get("roles") or s.get("role") or ""
+            role = roles_raw[0] if isinstance(roles_raw, list) and roles_raw else (roles_raw if isinstance(roles_raw, str) else "")
+            svc = s.get("service") or s.get("servicename") or s.get("service_name") or ""
+            sessions.append({
+                "id":        s.get("id", ""),
+                "username":  s.get("username", ""),
+                "ip":        s.get("framedipaddress", ""),
+                "nas_name":  nas,
+                "role":      role,
+                "service":   svc,
+                "start_time": _iso(s.get("acctstarttime", "")),
+                "state":     s.get("state", ""),
+            })
+        total = result.get("count", len(sessions)) if isinstance(result, dict) else len(sessions)
+        return {"status": "SUCCESS", "sessions": sessions, "total": total}
+
+    def get_user_sessions(self, username: str) -> List[Dict[str, Any]]:
+        result = self.client.query("/api/session", params={"filter": json.dumps({"username": username}, separators=(",", ":"))})
+        return self._items(result)
+
+    def get_auth_logs(self, start_time: str, end_time: str) -> List[Dict[str, Any]]:
+        result = self.client.query(
+            "/api/session",
+            params={"filter": json.dumps({"acctstarttime": {"$gte": start_time, "$lte": end_time}}, separators=(",", ":"))},
+        )
+        return self._items(result)
+
+    def _endpoint_search_result(self, ep: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalise a ClearPass endpoint into a global-search result."""
+        attrs = ep.get("attributes") or {}
+        # Prefer the Hostname attribute (populated by sync / profiler) for the
+        # display name; fall back to MAC so the row is never blank.
+        name = attrs.get("Hostname") or ep.get("mac_address", "")
+        return {
+            "source":  "cppm",
+            "type":    "endpoint",
+            "name":    name,
+            "ip":      ep.get("ip_address", ""),
+            "mac":     ep.get("mac_address", ""),
+            "status":  ep.get("status", ""),
+            "vendor":  ep.get("vendor_name", ""),
+            "id":      ep.get("id", ""),
+        }
+
+    @staticmethod
+    def _endpoint_matches(ep: Dict[str, Any], q: str) -> bool:
+        """True if `q` is a case-insensitive substring of any endpoint text
+        field — MAC, IP, status, vendor, or any attribute value (Hostname,
+        Tenant, etc.). Any part of any string matches. MACs are also compared
+        separator-stripped so a partial MAC typed without colons/dashes
+        ("445566") matches "11:22:33:44:55:66"."""
+        if not q:
+            return False
+        haystacks = [
+            ep.get("mac_address", ""),
+            ep.get("ip_address", ""),
+            ep.get("status", ""),
+            ep.get("vendor_name", ""),
+        ]
+        attrs = ep.get("attributes") or {}
+        if isinstance(attrs, dict):
+            for v in attrs.values():
+                if isinstance(v, str):
+                    haystacks.append(v)
+        if any(q in str(h).lower() for h in haystacks):
+            return True
+        # Separator-insensitive MAC match: strip everything but hex from both
+        # the query and the MAC, then substring-test.
+        q_hex = re.sub(r"[^0-9a-f]", "", q)
+        if q_hex:
+            mac_hex = re.sub(r"[^0-9a-f]", "", (ep.get("mac_address") or "").lower())
+            if q_hex in mac_hex:
+                return True
+        return False
+
+    def search(self, query: str) -> Dict[str, Any]:
+        """
+        Search CPPM endpoints (Device Inventory) and active sessions by
+        substring across MAC / IP / hostname / vendor / username / NAS.
+
+        ClearPass's REST `filter` only supports exact-equality (no SQL-LIKE),
+        so partial matching is done client-side: exact MAC/IP filters run first
+        (precise + cheap), then a bounded paged scan of the endpoint inventory
+        and the active-session list matches `q` as a case-insensitive substring
+        of any text field. Returns normalised results tagged source="cppm".
+        """
+        q = query.strip().lower()
+        if not q:
+            return {"status": "SUCCESS", "results": [], "count": 0}
+        results = []
+        seen_ids: set = set()
+        try:
+            # --- Exact endpoint lookup (MAC / IP) — precise & cheap ----------
+            for filter_def in [{"mac_address": q}, {"ip_address": q}]:
+                ep_r = self.client.query("/api/endpoint", params={"filter": json.dumps(filter_def, separators=(",", ":")), "limit": 10})
+                for ep in self._items(ep_r):
+                    if ep.get("id") and ep["id"] not in seen_ids:
+                        seen_ids.add(ep["id"])
+                        results.append(self._endpoint_search_result(ep))
+
+            # --- Endpoint substring scan (bounded) --------------------------
+            limit = 1000
+            offset = 0
+            scanned = 0
+            while scanned < self.SEARCH_SCAN_CAP:
+                ep_r = self.client.query("/api/endpoint", params={
+                    "limit": limit, "offset": offset, "calculate_count": "true"})
+                if isinstance(ep_r, dict) and ep_r.get("status") == "ERROR":
+                    logger.warning("endpoint substring scan failed: %s", ep_r.get("message"))
+                    break
+                items = self._items(ep_r)
+                if not items:
+                    break
+                for ep in items:
+                    if not self._endpoint_matches(ep, q):
+                        continue
+                    if ep.get("id") and ep["id"] in seen_ids:
+                        continue
+                    if ep.get("id"):
+                        seen_ids.add(ep["id"])
+                    results.append(self._endpoint_search_result(ep))
+                scanned += len(items)
+                count = ep_r.get("count", 0) if isinstance(ep_r, dict) else 0
+                offset += limit
+                if len(items) < limit or offset >= count:
+                    break
+
+            # --- Active sessions (bounded) — substring by IP/MAC/user/NAS ---
+            limit = 1000
+            offset = 0
+            while True:
+                session_r = self.client.query("/api/session", params={
+                    "limit": limit, "offset": offset, "calculate_count": "true"})
+                if isinstance(session_r, dict) and session_r.get("status") == "ERROR":
+                    logger.warning("session substring scan failed: %s", session_r.get("message"))
+                    break
+                items = self._items(session_r)
+                if not items:
+                    break
+                for s in items:
+                    fields = [
+                        s.get("username", ""),
+                        s.get("framedipaddress", ""),
+                        s.get("callingstation", ""),
+                        s.get("nasname", ""),
+                    ]
+                    roles = s.get("roles")
+                    if isinstance(roles, list):
+                        fields.extend(str(r) for r in roles)
+                    matched = any(q in str(f).lower() for f in fields)
+                    if not matched:
+                        # Separator-insensitive MAC match for callingstation.
+                        q_hex = re.sub(r"[^0-9a-f]", "", q)
+                        if q_hex:
+                            mac_hex = re.sub(r"[^0-9a-f]", "", (s.get("callingstation") or "").lower())
+                            matched = q_hex in mac_hex
+                    if not matched:
+                        continue
+                    results.append({
+                        "source":   "cppm",
+                        "type":     "session",
+                        "name":     s.get("username", ""),
+                        "ip":       s.get("framedipaddress", ""),
+                        "mac":      s.get("callingstation", ""),
+                        "nas":      s.get("nasname", ""),
+                        "role":     (roles or [""])[0] if isinstance(roles, list) else s.get("role", ""),
+                        "id":       s.get("id", ""),
+                    })
+                count = session_r.get("count", 0) if isinstance(session_r, dict) else 0
+                offset += limit
+                if len(items) < limit or offset >= count:
+                    break
+        except Exception as e:
+            logger.error(f"CPPM search failed: {e}")
+            return {"status": "ERROR", "message": str(e), "results": []}
+
+        # Deduplicate by id
+        seen: set = set()
+        unique = []
+        for r in results:
+            key = f"{r['source']}/{r['type']}/{r.get('id', r.get('mac', ''))}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(r)
+        return {"status": "SUCCESS", "results": unique, "count": len(unique)}
+
+    def list_roles(self) -> List[Dict[str, Any]]:
+        result = self.client.query("/api/role")
+        return self._items(result)
+
+    def get_system_health(self) -> Dict[str, Any]:
+        result = self.client.query("/api/server/version")
+        if isinstance(result, dict) and result.get("status") != "ERROR":
+            return {"status": "SUCCESS", "version": result.get("app_major_version", ""), "details": result}
+        return {"status": "ERROR", "message": result.get("message", "Unreachable")}
