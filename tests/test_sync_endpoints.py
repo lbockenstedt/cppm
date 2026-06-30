@@ -328,3 +328,57 @@ def test_sync_endpoints_drops_records_with_neither_mac_nor_ip(queries, mock_clie
     assert result["skipped"] == 0
     assert result["errors"] == 0
     mock_client._request.assert_not_called()
+
+# ── MAC-map batch optimization + PUT name normalization (422 self-heal) ──────
+
+def test_upsert_uses_mac_map_and_skips_per_record_get(queries, mock_client):
+    # When the batch-built mac_map resolves the MAC, _upsert_endpoint must NOT
+    # issue a per-record get_device_by_mac GET (the 185-GET timeout root cause).
+    existing = {"id": 3092, "mac_address": "aa:bb:cc:dd:ee:ff",
+                "name": "ws-01", "status": "Known", "attributes": {}}
+    mac_map = {"aa:bb:cc:dd:ee:ff": existing}
+    mock_client._request.return_value = {"status": "SUCCESS"}
+
+    outcome = queries._upsert_endpoint(
+        "aa:bb:cc:dd:ee:ff", "10.0.0.9", {"hostname": "ws-01"},
+        "lrb", "lrb", "LRB", "NetBox", ip_map=None, mac_map=mac_map)
+
+    assert outcome == "pushed"
+    # No per-record GET: mock_client.query (used by get_device_by_mac) untouched.
+    assert mock_client.query.call_count == 0
+    method, path = mock_client._request.call_args.args
+    assert method == "PUT"
+    assert path == "/api/endpoint/3092"   # the mapped endpoint's id
+
+
+def test_upsert_put_name_strips_whitespace_and_falls_through(queries, mock_client):
+    # ClearPass 422s on a whitespace-only `name`. The preserved name "   " is
+    # falsy after strip → fall through to mac.
+    existing = {"id": 3092, "mac_address": "aa:bb:cc:dd:ee:ff",
+                "name": "   ", "status": "Known", "attributes": {}}
+    mock_client.query.return_value = _hal([existing], 1)  # get_device_by_mac
+    mock_client._request.return_value = {"status": "SUCCESS"}
+
+    queries._upsert_endpoint(
+        "aa:bb:cc:dd:ee:ff", "10.0.0.9", {"hostname": ""},
+        "lrb", "lrb", "LRB", "NetBox", ip_map=None, mac_map=None)
+
+    body = mock_client._request.call_args.kwargs["json"]
+    assert body["name"] == "aa:bb:cc:dd:ee:ff"
+
+
+def test_upsert_put_name_truncated_to_255(queries, mock_client):
+    # ClearPass 422s on an over-long `name` (validation_messages:["name"]).
+    # A 1000-char preserved name is capped at 255.
+    existing = {"id": 3092, "mac_address": "aa:bb:cc:dd:ee:ff",
+                "name": "x" * 1000, "status": "Known", "attributes": {}}
+    mock_client.query.return_value = _hal([existing], 1)
+    mock_client._request.return_value = {"status": "SUCCESS"}
+
+    queries._upsert_endpoint(
+        "aa:bb:cc:dd:ee:ff", "10.0.0.9", {"hostname": ""},
+        "lrb", "lrb", "LRB", "NetBox", ip_map=None, mac_map=None)
+
+    body = mock_client._request.call_args.kwargs["json"]
+    assert len(body["name"]) == 255
+    assert body["name"] == "x" * 255

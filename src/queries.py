@@ -449,6 +449,56 @@ class CPPMQueries:
                     len(resolved), len(wanted))
         return resolved
 
+    def _build_mac_endpoint_map(self, target_macs: set) -> Dict[str, Dict[str, Any]]:
+        """Bounded paged scan of the endpoint inventory building normalized
+        MAC → endpoint for the requested MACs. Replaces the per-record
+        ``get_device_by_mac`` GET that ``_upsert_endpoint`` used to issue for
+        every MAC-bearing record (185 records ⇒ 185 extra round-trips ⇒ the
+        hub's 180s "Timed out waiting for spoke response"). One bounded scan
+        with early-stop once every wanted MAC is resolved (or ``SYNC_SCAN_CAP``
+        is hit) cuts the per-batch ClearPass calls roughly in half.
+
+        Best-effort: a CPPM paging failure, or a cap hit before all MACs are
+        found, returns whatever resolved so far — ``_upsert_endpoint`` falls
+        back to ``get_device_by_mac`` for any MAC still absent from the map, so
+        correctness is preserved (just slower for the unresolved few). Logs
+        scanned-vs-total so a cap hit is distinguishable from a real miss."""
+        resolved: Dict[str, Dict[str, Any]] = {}
+        wanted = {self._norm_mac(m) for m in target_macs if self._norm_mac(m)}
+        if not wanted:
+            return resolved
+        cap = self.SYNC_SCAN_CAP
+        limit = 1000
+        offset = 0
+        scanned = 0
+        total = 0
+        while scanned < cap:
+            ep_r = self.client.query("/api/endpoint", params={
+                "limit": limit, "offset": offset, "calculate_count": "true"})
+            if isinstance(ep_r, dict) and ep_r.get("status") == "ERROR":
+                logger.warning("endpoint MAC-map scan failed: %s", ep_r.get("message"))
+                break
+            items = self._items(ep_r)
+            if not items:
+                break
+            for ep in items:
+                m = self._norm_mac(ep.get("mac_address", ""))
+                if m and m in wanted and m not in resolved:
+                    resolved[m] = ep
+            scanned += len(items)
+            total = ep_r.get("count", total) if isinstance(ep_r, dict) else total
+            offset += limit
+            if len(items) < limit or offset >= total:
+                break
+            if all(m in resolved for m in wanted):
+                break
+        logger.info("endpoint MAC-map scan: scanned %d of %d endpoints (cap %d, %s); "
+                    "resolved %d of %d wanted MACs",
+                    scanned, total, cap,
+                    "CAPPED — raise SYNC_SCAN_CAP" if scanned >= cap else "complete",
+                    len(resolved), len(wanted))
+        return resolved
+
     def _build_session_ip_mac_map(self, target_ips: set) -> Dict[str, str]:
         """Bounded paged scan of ClearPass sessions building IP → MAC for the
         requested IPs. Used when a NetBox IP record has no MAC AND no existing
@@ -508,7 +558,8 @@ class CPPMQueries:
     def _upsert_endpoint(self, mac: str, ip: str, rec: Dict[str, Any],
                          tenant_id: str, tenant_slug: str, tenant_name: str,
                          source: str,
-                         ip_map: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
+                         ip_map: Optional[Dict[str, Dict[str, Any]]] = None,
+                         mac_map: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
         """Upsert one endpoint. Returns 'pushed' | 'skipped' | 'error'.
 
         Keyed on MAC (authoritative); falls back to IP lookup when MAC is empty.
@@ -516,11 +567,16 @@ class CPPMQueries:
         preserved); new ones are POSTed. IP-only records with no existing
         endpoint can't be created (ClearPass endpoints are MAC-keyed) → skipped.
 
-        ``ip_map`` (built once per batch by ``sync_endpoints``) is a fallback
-        for the IP lookup: the ClearPass ``ip_address`` filter only matches the
-        first-class field, so an endpoint whose IP lives in an attribute
-        (``IP Address`` etc.) is found here instead — letting the sync tag an
-        existing endpoint whose MAC the NetBox IP record lacks.
+        ``mac_map`` (built once per batch by ``sync_endpoints``) is the primary
+        MAC → existing-endpoint lookup so a batch doesn't issue a per-record
+        ``get_device_by_mac`` GET; a MAC absent from the map (cap hit / scan
+        failure) falls back to the per-record GET.
+
+        ``ip_map`` is the analogous fallback for the IP lookup: the ClearPass
+        ``ip_address`` filter only matches the first-class field, so an endpoint
+        whose IP lives in an attribute (``IP Address`` etc.) is found here
+        instead — letting the sync tag an existing endpoint whose MAC the
+        NetBox IP record lacks.
         """
         hostname = (rec.get("hostname", "") or "").strip()
         tag_attrs = {
@@ -538,7 +594,13 @@ class CPPMQueries:
 
         existing = None
         if mac:
-            existing = self.get_device_by_mac(mac)
+            # Prefer the batch-built MAC map (one scan for the whole batch);
+            # fall back to a per-record GET only for MACs the map didn't
+            # resolve (cap hit / scan failure).
+            nmac = self._norm_mac(mac)
+            existing = (mac_map or {}).get(nmac) if mac_map is not None else None
+            if not existing:
+                existing = self.get_device_by_mac(mac)
         elif ip:
             # Cheap exact-field filter first, then the batch IP→endpoint map
             # (attribute-based: ``IP Address`` etc.) so an existing endpoint
@@ -561,16 +623,29 @@ class CPPMQueries:
             # Unknown endpoint isn't silently flipped back to Known.
             body["status"] = existing.get("status") or "Known"
             # ClearPass also requires `name` on PUT — omitting it 422s with
-            # validation_messages:["name"]. Preserve the endpoint's existing
-            # name; fall back to mac, then ip, then a synthetic label so the
-            # field is never empty (an IP-only upsert of an existing endpoint
-            # has no mac to name it by).
-            body["name"] = existing.get("name") or mac or ip or f"endpoint-{ep_id}"
+            # validation_messages:["name"]. But a non-empty value alone isn't
+            # enough: ClearPass also 422s on `name` when the preserved value is
+            # whitespace-only OR exceeds its server-side length ceiling (the
+            # response body just says ["name"] either way). Strip, fall through
+            # to mac → ip → a synthetic label when blank, and cap at 255 so a
+            # long profiler-derived name doesn't re-fail on PUT.
+            name_val = (str(existing.get("name") or "").strip()
+                        or str(mac or "").strip()
+                        or str(ip or "").strip()
+                        or f"endpoint-{ep_id}")
+            body["name"] = name_val[:255].strip() or f"endpoint-{ep_id}"
             if mac:
                 body["mac_address"] = mac
             res = self.client._request("PUT", f"/api/endpoint/{ep_id}", json=body)
             if isinstance(res, dict) and res.get("status") == "ERROR":
-                logger.warning("endpoint PUT %s failed: %s", ep_id, res.get("message"))
+                # Include the name value + length we sent so a residual 422
+                # (e.g. a format/char constraint, or a different max-length)
+                # is diagnosable from the log instead of just "['name']".
+                _nv = body.get("name", "")
+                logger.warning("endpoint PUT %s failed: %s (sent name=%r len=%d mac=%r status=%r)",
+                               ep_id, res.get("message"),
+                               _nv[:80], len(str(_nv)), mac or "",
+                               body.get("status", ""))
                 return "error"
             return "pushed"
 
@@ -679,6 +754,22 @@ class CPPMQueries:
             batch_keys.add(key)
             batch.append((key, mac, ip, rec))
 
+        # MAC-bearing records: build a MAC → existing-endpoint map ONCE so
+        # _upsert_endpoint doesn't issue a per-record get_device_by_mac GET
+        # (185 records ⇒ 185 extra round-trips ⇒ the hub's 180s timeout). One
+        # bounded scan replaces them; unresolved MACs fall back to the per-
+        # record GET inside _upsert_endpoint.
+        mac_map: Optional[Dict[str, Dict[str, Any]]] = None
+        batch_macs = {mac for _, mac, ip, _ in batch if mac}
+        if batch_macs:
+            try:
+                mac_map = self._build_mac_endpoint_map(batch_macs)
+            except Exception as e:
+                logger.warning("endpoint sync tenant=%s MAC-map build failed: %s "
+                               "(falling back to per-record get_device_by_mac)",
+                               tenant_slug, e)
+                mac_map = None
+
         # IP-only records (no MAC on the NetBox side) need an existing
         # ClearPass endpoint found by IP so they can be tagged. The cheap
         # ``ip_address`` filter runs per-record inside _upsert_endpoint; this
@@ -750,7 +841,8 @@ class CPPMQueries:
         for key, mac, ip, rec in batch:
             try:
                 outcome = self._upsert_endpoint(mac, ip, rec, tenant_id, tenant_slug,
-                                                 tenant_name, source, ip_map=ip_map)
+                                                 tenant_name, source,
+                                                 ip_map=ip_map, mac_map=mac_map)
                 if outcome == "pushed":
                     pushed += 1
                 elif outcome == "skipped":
