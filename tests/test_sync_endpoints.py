@@ -130,6 +130,46 @@ def test_sync_endpoints_updates_existing_merging_attrs(queries, mock_client):
     assert body["attributes"]["Hostname"] == "ws-09"
 
 
+def test_sync_endpoints_ip_only_resolved_via_attribute_ip_map(queries, mock_client):
+    # IP-only NetBox record (no MAC). The ClearPass ``ip_address`` filter finds
+    # nothing, but the endpoint exists with its IP stored under the ``IP Address``
+    # attribute (as the sync itself writes) and a MAC. The batch IP→endpoint map
+    # resolves it so the existing endpoint is PUT-tagged for the tenant instead
+    # of being skipped.
+    ep = {"id": 90, "mac_address": "11:22:33:44:55:66",
+          "attributes": {"IP Address": "172.16.1.62", "Device Vendor": "Apple"}}
+
+    def query_side(path, params=None):
+        # ``_get_endpoint_by_ip`` sends a ``filter`` param → empty (the field
+        # isn't populated); the map scan pages with ``limit``/``offset`` → the
+        # endpoint carrying the ``IP Address`` attribute.
+        if params and "filter" in params:
+            return _hal([], 0)
+        return _hal([ep], 1)
+
+    mock_client.query.side_effect = query_side
+    mock_client._request.return_value = {"id": 90}
+
+    result = queries.sync_endpoints(
+        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        source="NetBox", replace=False,
+        endpoints=[{"ip": "172.16.1.62", "mac": "", "hostname": "ws-62"}],
+    )
+
+    assert result["status"] == "SUCCESS"
+    assert result["pushed"] == 1
+    assert result["skipped"] == 0
+    method, path = mock_client._request.call_args.args
+    assert method == "PUT"
+    assert path == "/api/endpoint/90"
+    body = mock_client._request.call_args.kwargs["json"]
+    # Existing profiler attribute preserved + tenant tags + IP/hostname added.
+    assert body["attributes"]["Device Vendor"] == "Apple"
+    assert body["attributes"]["NetBox_Tenant_Slug"] == "lrb"
+    assert body["attributes"]["IP Address"] == "172.16.1.62"
+    assert body["attributes"]["Hostname"] == "ws-62"
+
+
 def test_sync_endpoints_drops_records_with_neither_mac_nor_ip(queries, mock_client):
     mock_client.query.return_value = _hal([], 0)
     result = queries.sync_endpoints(

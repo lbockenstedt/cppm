@@ -64,6 +64,14 @@ class CPPMQueries:
     # search dropdown's responsiveness; raise if a deployment needs deeper reach.
     SEARCH_SCAN_CAP = 5000
 
+    # Attribute names ClearPass may store an endpoint's IP under. The REST
+    # ``filter`` only matches the first-class ``ip_address`` field, but the
+    # profiler (and this sync itself, via ``IP Address``) often stores it under
+    # an attribute instead — so an IP-only NetBox record can't always be
+    # matched by the filter alone. The fallback scan checks every name here.
+    _IP_ATTRS = ("IP Address", "ip_address", "ip", "Framed-IP-Address",
+                 "Framed-IP-Address-Nas")
+
     def __init__(self, client: CPPMClient):
         self.client = client
 
@@ -256,15 +264,82 @@ class CPPMQueries:
         items = self._items(result)
         return items[0] if items else None
 
+    @staticmethod
+    def _endpoint_ips(ep: Dict[str, Any]) -> set:
+        """Every IP address carried by a CPPM endpoint, across the attribute
+        names the profiler / this sync may store it under (plus the first-class
+        ``ip_address`` field). Empty values dropped; no normalization beyond strip
+        so callers can match both raw and ``/32``-suffixed forms."""
+        ips: set = set()
+        if not isinstance(ep, dict):
+            return ips
+        top = ep.get("ip_address")
+        if isinstance(top, str) and top.strip():
+            ips.add(top.strip())
+        attrs = ep.get("attributes") or {}
+        if isinstance(attrs, dict):
+            for k in CPPMQueries._IP_ATTRS:
+                v = attrs.get(k)
+                if isinstance(v, str) and v.strip():
+                    ips.add(v.strip())
+        return ips
+
+    def _build_ip_endpoint_map(self, target_ips: set) -> Dict[str, Dict[str, Any]]:
+        """Bounded paged scan of the endpoint inventory building IP → endpoint
+        for the requested IPs. Used when a NetBox IP record has no MAC: the
+        ClearPass ``ip_address`` filter (``_get_endpoint_by_ip``) only matches
+        the first-class field, so an endpoint whose IP lives in an attribute
+        (``IP Address`` etc.) is missed. This scan finds it so its MAC can be
+        reused and the endpoint tagged for the tenant.
+
+        Stops early once every requested IP is resolved or ``SEARCH_SCAN_CAP``
+        is hit. Best-effort: a CPPM paging failure returns whatever resolved so
+        far (the sync then skips the unresolved IPs as before)."""
+        resolved: Dict[str, Dict[str, Any]] = {}
+        wanted = {str(ip).strip() for ip in target_ips if str(ip).strip()}
+        if not wanted:
+            return resolved
+        limit = 1000
+        offset = 0
+        scanned = 0
+        while scanned < self.SEARCH_SCAN_CAP:
+            ep_r = self.client.query("/api/endpoint", params={
+                "limit": limit, "offset": offset, "calculate_count": "true"})
+            if isinstance(ep_r, dict) and ep_r.get("status") == "ERROR":
+                logger.warning("endpoint IP-map scan failed: %s", ep_r.get("message"))
+                break
+            items = self._items(ep_r)
+            if not items:
+                break
+            for ep in items:
+                for ip in self._endpoint_ips(ep):
+                    if ip in wanted and ip not in resolved:
+                        resolved[ip] = ep
+            scanned += len(items)
+            count = ep_r.get("count", 0) if isinstance(ep_r, dict) else 0
+            offset += limit
+            if len(items) < limit or offset >= count:
+                break
+            if all(ip in resolved for ip in wanted):
+                break
+        return resolved
+
     def _upsert_endpoint(self, mac: str, ip: str, rec: Dict[str, Any],
                          tenant_id: str, tenant_slug: str, tenant_name: str,
-                         source: str) -> str:
+                         source: str,
+                         ip_map: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
         """Upsert one endpoint. Returns 'pushed' | 'skipped' | 'error'.
 
         Keyed on MAC (authoritative); falls back to IP lookup when MAC is empty.
         Existing endpoints are PUT-merged (so profiler-derived attributes are
         preserved); new ones are POSTed. IP-only records with no existing
         endpoint can't be created (ClearPass endpoints are MAC-keyed) → skipped.
+
+        ``ip_map`` (built once per batch by ``sync_endpoints``) is a fallback
+        for the IP lookup: the ClearPass ``ip_address`` filter only matches the
+        first-class field, so an endpoint whose IP lives in an attribute
+        (``IP Address`` etc.) is found here instead — letting the sync tag an
+        existing endpoint whose MAC the NetBox IP record lacks.
         """
         hostname = (rec.get("hostname", "") or "").strip()
         tag_attrs = {
@@ -284,7 +359,12 @@ class CPPMQueries:
         if mac:
             existing = self.get_device_by_mac(mac)
         elif ip:
+            # Cheap exact-field filter first, then the batch IP→endpoint map
+            # (attribute-based: ``IP Address`` etc.) so an existing endpoint
+            # whose MAC the source record lacks is still found and tagged.
             existing = self._get_endpoint_by_ip(ip)
+            if not existing and ip_map:
+                existing = ip_map.get(ip)
 
         if existing:
             ep_id = existing.get("id")
@@ -399,12 +479,33 @@ class CPPMQueries:
             batch_keys.add(key)
             batch.append((key, mac, ip, rec))
 
+        # IP-only records (no MAC on the NetBox side) need an existing
+        # ClearPass endpoint found by IP so they can be tagged. The cheap
+        # ``ip_address`` filter runs per-record inside _upsert_endpoint; this
+        # batch-level map is the attribute-based fallback (``IP Address`` etc.)
+        # built once so we don't re-scan the inventory per record.
+        ip_map: Optional[Dict[str, Dict[str, Any]]] = None
+        ip_only = {ip for _, mac, ip, _ in batch if not mac and ip}
+        if ip_only:
+            try:
+                ip_map = self._build_ip_endpoint_map(ip_only)
+                logger.info("endpoint sync tenant=%s IP→endpoint map: %d of %d "
+                            "IP-only records resolved from ClearPass",
+                            tenant_slug, len({ip for ip in ip_only if ip in ip_map}),
+                            len(ip_only))
+            except Exception as e:
+                logger.warning("endpoint sync tenant=%s IP-map build failed: %s "
+                               "(falling back to exact ip_address filter only)",
+                               tenant_slug, e)
+                ip_map = None
+
         pushed = errors = skipped = 0
         err_msgs: List[str] = []
         skipped_details: List[Dict[str, Any]] = []
         for key, mac, ip, rec in batch:
             try:
-                outcome = self._upsert_endpoint(mac, ip, rec, tenant_id, tenant_slug, tenant_name, source)
+                outcome = self._upsert_endpoint(mac, ip, rec, tenant_id, tenant_slug,
+                                                 tenant_name, source, ip_map=ip_map)
                 if outcome == "pushed":
                     pushed += 1
                 elif outcome == "skipped":
