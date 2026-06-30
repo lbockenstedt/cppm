@@ -268,6 +268,26 @@ class CPPMQueries:
             return ":".join(hexonly[i:i + 2] for i in range(0, 12, 2))
         return m
 
+    @staticmethod
+    def _coerce_attrs(attrs: Any) -> Dict[str, str]:
+        """Coerce endpoint attribute values to strings, dropping nulls.
+
+        ClearPass requires every endpoint attribute value to be a string; a
+        non-string (number/bool/list) or null in a PUT/POST body makes the
+        whole request fail with 422. The PUT-merge round-trips an existing
+        endpoint's *entire* attribute map (including profiler-populated values
+        that may not be strings), so coerce before sending so a profiler
+        attribute can't break the merge.
+        """
+        if not isinstance(attrs, dict):
+            return {}
+        out: Dict[str, str] = {}
+        for k, v in attrs.items():
+            if v is None:
+                continue
+            out[k] = v if isinstance(v, str) else str(v)
+        return out
+
     def _get_endpoint_by_ip(self, ip: str) -> Optional[Dict[str, Any]]:
         result = self.client.query("/api/endpoint", params={"filter": json.dumps({"ip_address": ip}, separators=(",", ":"))})
         items = self._items(result)
@@ -449,6 +469,7 @@ class CPPMQueries:
                 return "error"
             cur_attrs = dict(existing.get("attributes") or {})
             cur_attrs.update(tag_attrs)
+            cur_attrs = self._coerce_attrs(cur_attrs)
             body: Dict[str, Any] = {"id": ep_id, "attributes": cur_attrs, "description": description}
             if mac:
                 body["mac_address"] = mac
@@ -471,7 +492,7 @@ class CPPMQueries:
             return "skipped"
 
         body = {"mac_address": mac, "description": description,
-                "attributes": tag_attrs, "status": "Known"}
+                "attributes": self._coerce_attrs(tag_attrs), "status": "Known"}
         res = self.client._request("POST", "/api/endpoint", json=body)
         if isinstance(res, dict) and res.get("status") == "ERROR":
             logger.warning("endpoint POST %s failed: %s", mac, res.get("message"))

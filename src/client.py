@@ -155,8 +155,19 @@ class CPPMClient:
                 return {"status": "SUCCESS"}
             return response.json()
         except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error {e.response.status_code} for {method} {url}")
-            return {"status": "ERROR", "message": str(e), "code": e.response.status_code if e.response else None}
+            # ClearPass returns the *why* (validation failures, missing fields)
+            # in the response body — e.g. a 422 names the offending attribute.
+            # str(e) alone is just the status line, so surface the body too.
+            detail = ""
+            if e.response is not None:
+                try:
+                    detail = (e.response.text or "")[:500]
+                except Exception:
+                    detail = ""
+            code = e.response.status_code if e.response is not None else None
+            logger.error("HTTP error %s for %s %s: %s", code, method, url, detail or "<no body>")
+            msg = str(e) if not detail else f"{e} | body: {detail}"
+            return {"status": "ERROR", "message": msg, "code": code}
         except requests.exceptions.RequestException as e:
             logger.error(f"Request failed for {method} {url}: {e}")
             return {"status": "ERROR", "message": str(e)}

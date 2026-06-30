@@ -278,6 +278,39 @@ def test_sync_endpoints_borrowed_mac_merges_existing_no_duplicate(queries, mock_
     assert body["attributes"]["IP Address"] == "10.9.9.9"
 
 
+def test_sync_endpoints_coerces_nonstring_attr_on_put(queries, mock_client):
+    # PUT-merge round-trips the existing endpoint's *entire* attribute map.
+    # A profiler attribute that isn't a string (here an int, or a null) would
+    # make ClearPass reject the whole PUT with 422 — values are coerced to
+    # strings and nulls dropped so the merge can't break.
+    existing = {"id": 3018, "mac_address": "aa:bb:cc:dd:ee:ff",
+                "attributes": {"Some Int": 5, "Dropped": None, "Device Vendor": "Apple"}}
+
+    def query_side(path, params=None):
+        if params and "filter" in params:
+            return _hal([existing], 1)
+        return _hal([], 0)
+
+    mock_client.query.side_effect = query_side
+    mock_client._request.return_value = {"id": 3018}
+
+    result = queries.sync_endpoints(
+        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        source="NetBox", replace=False,
+        endpoints=[{"ip": "172.16.1.62", "mac": "AA-BB-CC-DD-EE-FF", "hostname": "ws-62"}],
+    )
+
+    assert result["status"] == "SUCCESS"
+    assert result["pushed"] == 1
+    body = mock_client._request.call_args.kwargs["json"]
+    attrs = body["attributes"]
+    # Non-string coerced to str; null dropped; string + tenant tags preserved.
+    assert attrs["Some Int"] == "5"
+    assert "Dropped" not in attrs
+    assert attrs["Device Vendor"] == "Apple"
+    assert attrs["NetBox_Tenant_Slug"] == "lrb"
+
+
 def test_sync_endpoints_drops_records_with_neither_mac_nor_ip(queries, mock_client):
     mock_client.query.return_value = _hal([], 0)
     result = queries.sync_endpoints(
