@@ -204,6 +204,80 @@ def test_sync_endpoints_ip_only_resolved_via_unexpected_attr_name(queries, mock_
     assert body["attributes"]["IP Address"] == "10.9.9.9"
 
 
+def test_sync_endpoints_ip_only_borrows_mac_from_session_then_creates(queries, mock_client):
+    # IP-only NetBox record, no existing endpoint by IP (inventory scan empty),
+    # but a ClearPass session carries framedipaddress=ip + callingstationid=MAC.
+    # The sync borrows the MAC and POSTs a NEW tenant-tagged endpoint instead of
+    # skipping.
+    session = {"framedipaddress": "10.9.9.9", "callingstationid": "AABBCCDDEEFF",
+               "username": "10.9.9.9"}
+
+    def query_side(path, params=None):
+        if path == "/api/session":
+            return _hal([session], 1)
+        # /api/endpoint: empty for both the inventory IP-map scan (no filter) and
+        # the get_device_by_mac lookup (filter) → no existing endpoint.
+        return _hal([], 0)
+
+    mock_client.query.side_effect = query_side
+    mock_client._request.return_value = {"id": 555}
+
+    result = queries.sync_endpoints(
+        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        source="NetBox", replace=False,
+        endpoints=[{"ip": "10.9.9.9", "mac": "", "hostname": "ws-99"}],
+    )
+
+    assert result["status"] == "SUCCESS"
+    assert result["pushed"] == 1
+    assert result["skipped"] == 0
+    method, path = mock_client._request.call_args.args
+    assert method == "POST"
+    assert path == "/api/endpoint"
+    body = mock_client._request.call_args.kwargs["json"]
+    # Borrowed MAC normalized to colon form; tenant tags + IP/hostname written.
+    assert body["mac_address"] == "aa:bb:cc:dd:ee:ff"
+    assert body["status"] == "Known"
+    assert body["attributes"]["NetBox_Tenant_Slug"] == "lrb"
+    assert body["attributes"]["IP Address"] == "10.9.9.9"
+    assert body["attributes"]["Hostname"] == "ws-99"
+
+
+def test_sync_endpoints_borrowed_mac_merges_existing_no_duplicate(queries, mock_client):
+    # IP-only record; session lends a MAC, but an endpoint with that MAC already
+    # exists (profiler attribute to preserve). The sync PUT-merges it (tags the
+    # tenant) rather than POSTing a duplicate.
+    session = {"framedipaddress": "10.9.9.9", "callingstationid": "AABBCCDDEEFF"}
+    existing = {"id": 77, "mac_address": "aa:bb:cc:dd:ee:ff",
+                "attributes": {"Device Vendor": "Apple"}}
+
+    def query_side(path, params=None):
+        if path == "/api/session":
+            return _hal([session], 1)
+        if params and "filter" in params:
+            return _hal([existing], 1)  # get_device_by_mac finds it
+        return _hal([], 0)              # inventory IP-map scan: empty
+
+    mock_client.query.side_effect = query_side
+    mock_client._request.return_value = {"id": 77}
+
+    result = queries.sync_endpoints(
+        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        source="NetBox", replace=False,
+        endpoints=[{"ip": "10.9.9.9", "mac": "", "hostname": "ws-99"}],
+    )
+
+    assert result["status"] == "SUCCESS"
+    assert result["pushed"] == 1
+    method, path = mock_client._request.call_args.args
+    assert method == "PUT"
+    assert path == "/api/endpoint/77"
+    body = mock_client._request.call_args.kwargs["json"]
+    assert body["attributes"]["Device Vendor"] == "Apple"  # preserved
+    assert body["attributes"]["NetBox_Tenant_Slug"] == "lrb"
+    assert body["attributes"]["IP Address"] == "10.9.9.9"
+
+
 def test_sync_endpoints_drops_records_with_neither_mac_nor_ip(queries, mock_client):
     mock_client.query.return_value = _hal([], 0)
     result = queries.sync_endpoints(

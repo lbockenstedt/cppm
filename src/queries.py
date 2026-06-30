@@ -328,6 +328,54 @@ class CPPMQueries:
                 break
         return resolved
 
+    def _build_session_ip_mac_map(self, target_ips: set) -> Dict[str, str]:
+        """Bounded paged scan of ClearPass sessions building IP → MAC for the
+        requested IPs. Used when a NetBox IP record has no MAC AND no existing
+        ClearPass endpoint carries its IP: a session (Access Tracker) whose
+        ``framedipaddress`` matches the IP still exposes the device's MAC
+        (``callingstationid``), so the sync can create a tenant-tagged endpoint
+        for it instead of skipping.
+
+        Returns IP → normalized MAC. Best-effort: a paging failure returns
+        whatever resolved so far. Stops early once every requested IP is resolved
+        or ``SEARCH_SCAN_CAP`` is hit."""
+        resolved: Dict[str, str] = {}
+        wanted = {str(ip).strip() for ip in target_ips if str(ip).strip()}
+        if not wanted:
+            return resolved
+        limit = 1000
+        offset = 0
+        scanned = 0
+        while scanned < self.SEARCH_SCAN_CAP:
+            s_r = self.client.query("/api/session", params={
+                "limit": limit, "offset": offset, "calculate_count": "true"})
+            if isinstance(s_r, dict) and s_r.get("status") == "ERROR":
+                logger.warning("session IP→MAC scan failed: %s", s_r.get("message"))
+                break
+            items = self._items(s_r)
+            if not items:
+                break
+            for s in items:
+                ip = (s.get("framedipaddress") or "").strip()
+                if not ip or ip not in wanted or ip in resolved:
+                    continue
+                # ``callingstationid`` is the confirmed /api/session field for
+                # the caller (endpoint) MAC; some ClearPass versions / the older
+                # access-tracker code use ``callingstation`` / a ``mac`` key, so
+                # accept all three.
+                mac_raw = s.get("callingstationid") or s.get("callingstation") or s.get("mac") or ""
+                mac = self._norm_mac(mac_raw)
+                if mac:
+                    resolved[ip] = mac
+            scanned += len(items)
+            count = s_r.get("count", 0) if isinstance(s_r, dict) else 0
+            offset += limit
+            if len(items) < limit or offset >= count:
+                break
+            if all(ip in resolved for ip in wanted):
+                break
+        return resolved
+
     def _upsert_endpoint(self, mac: str, ip: str, rec: Dict[str, Any],
                          tenant_id: str, tenant_slug: str, tenant_name: str,
                          source: str,
@@ -461,6 +509,13 @@ class CPPMQueries:
         IPAM source is treated as the source of truth: endpoints previously
         tagged with this tenant that are absent from the batch are deleted.
 
+        IP-only records (no MAC on the NetBox side) are resolved two ways before
+        the upsert: (1) an existing ClearPass endpoint found by IP — its MAC is
+        reused and the endpoint PUT-tagged; (2) if none, a MAC borrowed from a
+        live ClearPass session whose framedipaddress matches — a new endpoint is
+        created tagged for the tenant. Records left with no MAC after both are
+        skipped (ClearPass endpoints are MAC-keyed).
+
         Returns {status, pushed, errors, skipped, removed, message}. The hub
         reads status/pushed/errors/message; skipped/removed are extra detail.
         """
@@ -511,6 +566,42 @@ class CPPMQueries:
                                "(falling back to exact ip_address filter only)",
                                tenant_slug, e)
                 ip_map = None
+
+        # Fallback MAC source for IP-only records the endpoint inventory did NOT
+        # resolve: a live ClearPass session (Access Tracker) whose
+        # ``framedipaddress`` matches. CPPM has the device's MAC in the session
+        # even when no endpoint record carries the IP, so borrowing it lets the
+        # sync create a tenant-tagged endpoint instead of skipping. Best-effort;
+        # typical 802.1X+DHCP sessions don't carry framedipaddress, so this often
+        # resolves 0 — logged so it's distinguishable from a silent skip.
+        unresolved = ip_only - set(ip_map or {})
+        if unresolved:
+            try:
+                session_mac_map = self._build_session_ip_mac_map(unresolved)
+                sm_n = len(session_mac_map)
+                if sm_n:
+                    logger.info("endpoint sync tenant=%s session IP→MAC map: %d of %d "
+                                "unresolved IP-only records borrowed a MAC from "
+                                "ClearPass sessions", tenant_slug, sm_n, len(unresolved))
+                else:
+                    logger.info("endpoint sync tenant=%s session IP→MAC map: 0 of %d "
+                                "unresolved IP-only records had a session with "
+                                "framedipaddress — no MAC to borrow. IPs: %s",
+                                tenant_slug, len(unresolved),
+                                ", ".join(sorted(unresolved)[:10]))
+                # Apply borrowed MACs to the batch in place so each record becomes
+                # MAC-bearing for the upsert AND batch_keys carries the borrowed
+                # MAC (the new endpoint's key) — otherwise the replace-scan would
+                # delete the endpoint we just created in the same pass.
+                for i, (key, mac, ip, rec) in enumerate(batch):
+                    if not mac and ip and ip in session_mac_map:
+                        borrowed = session_mac_map[ip]
+                        batch[i] = (borrowed, borrowed, ip, rec)
+                        batch_keys.discard(key)   # drop the old ip:{ip} key
+                        batch_keys.add(borrowed)   # new key = borrowed MAC
+            except Exception as e:
+                logger.warning("endpoint sync tenant=%s session MAC-map build failed: "
+                               "%s (skipping session fallback)", tenant_slug, e)
 
         pushed = errors = skipped = 0
         err_msgs: List[str] = []
