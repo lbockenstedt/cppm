@@ -52,6 +52,9 @@ def test_sync_endpoints_creates_new_endpoint(queries, mock_client):
     body = mock_client._request.call_args.kwargs["json"]
     assert body["mac_address"] == "aa:bb:cc:dd:ee:ff"
     assert body["status"] == "Known"
+    # ClearPass requires `name` on the endpoint body (a PUT/POST omitting it
+    # 422s with validation_messages:["name"]). POST names the endpoint by MAC.
+    assert body["name"] == "aa:bb:cc:dd:ee:ff"
     assert body["attributes"]["NetBox_Tenant_Slug"] == "lrb"
     assert body["attributes"]["NetBox_Tenant_Name"] == "LRB"
     assert body["attributes"]["NetBox_Tenant_ID"] == "lrb"
@@ -128,6 +131,10 @@ def test_sync_endpoints_updates_existing_merging_attrs(queries, mock_client):
     assert body["attributes"]["Tenant"] == "LRB"
     assert body["attributes"]["Tenant_Slug"] == "lrb"
     assert body["attributes"]["Hostname"] == "ws-09"
+    # ClearPass requires `name` on PUT too — preserved from the existing
+    # endpoint, falling back to mac when it has none.
+    assert body["name"] == "aa:bb:cc:dd:ee:ff"
+    assert body["status"]  # status present (Known / preserved)
 
 
 def test_sync_endpoints_ip_only_resolved_via_attribute_ip_map(queries, mock_client):

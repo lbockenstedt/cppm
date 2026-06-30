@@ -476,6 +476,12 @@ class CPPMQueries:
             # must be specified". Preserve an existing status so a Disabled /
             # Unknown endpoint isn't silently flipped back to Known.
             body["status"] = existing.get("status") or "Known"
+            # ClearPass also requires `name` on PUT — omitting it 422s with
+            # validation_messages:["name"]. Preserve the endpoint's existing
+            # name; fall back to mac, then ip, then a synthetic label so the
+            # field is never empty (an IP-only upsert of an existing endpoint
+            # has no mac to name it by).
+            body["name"] = existing.get("name") or mac or ip or f"endpoint-{ep_id}"
             if mac:
                 body["mac_address"] = mac
             res = self.client._request("PUT", f"/api/endpoint/{ep_id}", json=body)
@@ -496,7 +502,7 @@ class CPPMQueries:
                 tenant_slug, ip or "<empty>", hostname or "<empty>")
             return "skipped"
 
-        body = {"mac_address": mac, "description": description,
+        body = {"mac_address": mac, "name": mac, "description": description,
                 "attributes": self._coerce_attrs(tag_attrs), "status": "Known"}
         res = self.client._request("POST", "/api/endpoint", json=body)
         if isinstance(res, dict) and res.get("status") == "ERROR":
