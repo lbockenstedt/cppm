@@ -471,6 +471,11 @@ class CPPMQueries:
             cur_attrs.update(tag_attrs)
             cur_attrs = self._coerce_attrs(cur_attrs)
             body: Dict[str, Any] = {"id": ep_id, "attributes": cur_attrs, "description": description}
+            # ClearPass requires `status` on PUT too (POST sets "Known" below);
+            # omitting it 422s with "Endpoint status (Known / Unknown / Disabled)
+            # must be specified". Preserve an existing status so a Disabled /
+            # Unknown endpoint isn't silently flipped back to Known.
+            body["status"] = existing.get("status") or "Known"
             if mac:
                 body["mac_address"] = mac
             res = self.client._request("PUT", f"/api/endpoint/{ep_id}", json=body)

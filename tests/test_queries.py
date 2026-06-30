@@ -80,3 +80,40 @@ def test_get_auth_logs_success(queries, mock_client):
     assert len(result) == 2
     assert result[0]["event"] == "auth_success"
     mock_client.query.assert_called_once_with("/api/logs/auth", params={"start": "2026-06-07T00:00:00Z", "end": "2026-06-07T23:59:59Z"})
+
+
+# ── _upsert_endpoint PUT must include status (422 fix) ──────────────────────
+
+def test_upsert_endpoint_put_preserves_existing_status(queries, mock_client):
+    """ClearPass requires `status` on PUT (POST sets "Known"). The PUT body must
+    carry it and preserve an existing non-default status (Disabled/Unknown)
+    instead of flipping it back to Known."""
+    queries.get_device_by_mac = MagicMock(return_value={
+        "id": 3018, "status": "Disabled", "attributes": {"OS": "Win"}})
+    mock_client._request.return_value = {"status": "SUCCESS"}
+
+    res = queries._upsert_endpoint("aa:bb:cc:dd:ee:ff", "10.0.0.5",
+                                   {"hostname": "ws"}, "t1", "lrb", "LRB", "NetBox")
+
+    assert res == "pushed"
+    call = mock_client._request.call_args
+    assert call.args[0] == "PUT"
+    body = call.kwargs["json"]
+    assert body["id"] == 3018
+    assert body["status"] == "Disabled"   # preserved, not reset to Known
+    assert body["mac_address"] == "aa:bb:cc:dd:ee:ff"
+
+
+def test_upsert_endpoint_put_defaults_status_known_when_missing(queries, mock_client):
+    """An existing endpoint with no status field → PUT body defaults to Known
+    (parity with the POST path) so ClearPass accepts the upsert."""
+    queries.get_device_by_mac = MagicMock(return_value={
+        "id": 3019, "attributes": {}})
+    mock_client._request.return_value = {"status": "SUCCESS"}
+
+    res = queries._upsert_endpoint("aa:bb:cc:dd:ee:ff", "10.0.0.5",
+                                   {"hostname": "ws"}, "t1", "lrb", "LRB", "NetBox")
+
+    assert res == "pushed"
+    body = mock_client._request.call_args.kwargs["json"]
+    assert body["status"] == "Known"
