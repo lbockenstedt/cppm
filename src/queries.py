@@ -64,13 +64,14 @@ class CPPMQueries:
     # search dropdown's responsiveness; raise if a deployment needs deeper reach.
     SEARCH_SCAN_CAP = 5000
 
-    # Attribute names ClearPass may store an endpoint's IP under. The REST
-    # ``filter`` only matches the first-class ``ip_address`` field, but the
-    # profiler (and this sync itself, via ``IP Address``) often stores it under
-    # an attribute instead — so an IP-only NetBox record can't always be
-    # matched by the filter alone. The fallback scan checks every name here.
-    _IP_ATTRS = ("IP Address", "ip_address", "ip", "Framed-IP-Address",
-                 "Framed-IP-Address-Nas")
+    # An endpoint's IP can live under varying attribute names depending on the
+    # profiler / sync path (``IP Address``, ``Framed-IP-Address``, a vendor-
+    # specific name, …). The REST ``filter`` only matches the first-class
+    # ``ip_address`` field, so an IP-only NetBox record can't always be matched
+    # by the filter alone. The fallback scan (_endpoint_ips) is therefore
+    # name-agnostic: it checks the value of EVERY attribute for the wanted IP
+    # rather than guessing names, so an endpoint carrying the IP under any name
+    # is found and its MAC reused. See _build_ip_endpoint_map.
 
     def __init__(self, client: CPPMClient):
         self.client = client
@@ -266,22 +267,25 @@ class CPPMQueries:
 
     @staticmethod
     def _endpoint_ips(ep: Dict[str, Any]) -> set:
-        """Every IP address carried by a CPPM endpoint, across the attribute
-        names the profiler / this sync may store it under (plus the first-class
-        ``ip_address`` field). Empty values dropped; no normalization beyond strip
-        so callers can match both raw and ``/32``-suffixed forms."""
+        """Every IP address carried by a CPPM endpoint — the first-class
+        ``ip_address`` field plus the value of ANY attribute. ClearPass stores
+        the endpoint IP under varying attribute names depending on the profiler
+        / sync path, so rather than guess names we scan every attribute value.
+        Values are stripped of a trailing CIDR suffix so a ``/32`` form still
+        matches a bare wanted IP. Non-IP attribute values are collected too
+        (harmless: only values equal to a wanted IP ever match downstream in
+        _build_ip_endpoint_map, and a junk string can't equal a real IP)."""
         ips: set = set()
         if not isinstance(ep, dict):
             return ips
         top = ep.get("ip_address")
         if isinstance(top, str) and top.strip():
-            ips.add(top.strip())
+            ips.add(top.strip().split("/")[0].strip())
         attrs = ep.get("attributes") or {}
         if isinstance(attrs, dict):
-            for k in CPPMQueries._IP_ATTRS:
-                v = attrs.get(k)
+            for v in attrs.values():
                 if isinstance(v, str) and v.strip():
-                    ips.add(v.strip())
+                    ips.add(v.strip().split("/")[0].strip())
         return ips
 
     def _build_ip_endpoint_map(self, target_ips: set) -> Dict[str, Dict[str, Any]]:
@@ -489,10 +493,19 @@ class CPPMQueries:
         if ip_only:
             try:
                 ip_map = self._build_ip_endpoint_map(ip_only)
-                logger.info("endpoint sync tenant=%s IP→endpoint map: %d of %d "
-                            "IP-only records resolved from ClearPass",
-                            tenant_slug, len({ip for ip in ip_only if ip in ip_map}),
-                            len(ip_only))
+                resolved_n = len({ip for ip in ip_only if ip in ip_map})
+                if ip_only and resolved_n == 0:
+                    logger.warning("endpoint sync tenant=%s: IP→endpoint map resolved "
+                                   "0 of %d IP-only records — ClearPass has no endpoint "
+                                   "carrying any of these IPs, so they will be skipped "
+                                   "(no MAC to attach). If the devices are expected in "
+                                   "ClearPass, verify the endpoint inventory. IPs: %s",
+                                   tenant_slug, len(ip_only),
+                                   ", ".join(sorted(ip_only)[:10]))
+                else:
+                    logger.info("endpoint sync tenant=%s IP→endpoint map: %d of %d "
+                                "IP-only records resolved from ClearPass",
+                                tenant_slug, resolved_n, len(ip_only))
             except Exception as e:
                 logger.warning("endpoint sync tenant=%s IP-map build failed: %s "
                                "(falling back to exact ip_address filter only)",

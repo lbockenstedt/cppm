@@ -170,6 +170,40 @@ def test_sync_endpoints_ip_only_resolved_via_attribute_ip_map(queries, mock_clie
     assert body["attributes"]["Hostname"] == "ws-62"
 
 
+def test_sync_endpoints_ip_only_resolved_via_unexpected_attr_name(queries, mock_client):
+    # IP-only NetBox record. The ClearPass ``ip_address`` filter finds nothing,
+    # and the endpoint carries its IP under an attribute name NOT in any
+    # hardcoded list ("Device IP" — a plausible profiler attribute). The
+    # name-agnostic IP→endpoint map scans every attribute value, so the endpoint
+    # is still found and PUT-tagged for the tenant instead of being skipped.
+    ep = {"id": 91, "mac_address": "22:33:44:55:66:77",
+          "attributes": {"Device IP": "10.9.9.9", "Device Vendor": "Cisco"}}
+
+    def query_side(path, params=None):
+        if params and "filter" in params:
+            return _hal([], 0)
+        return _hal([ep], 1)
+
+    mock_client.query.side_effect = query_side
+    mock_client._request.return_value = {"id": 91}
+
+    result = queries.sync_endpoints(
+        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        source="NetBox", replace=False,
+        endpoints=[{"ip": "10.9.9.9", "mac": "", "hostname": "ws-99"}],
+    )
+
+    assert result["status"] == "SUCCESS"
+    assert result["pushed"] == 1
+    assert result["skipped"] == 0
+    method, path = mock_client._request.call_args.args
+    assert method == "PUT"
+    assert path == "/api/endpoint/91"
+    body = mock_client._request.call_args.kwargs["json"]
+    assert body["attributes"]["NetBox_Tenant_Slug"] == "lrb"
+    assert body["attributes"]["IP Address"] == "10.9.9.9"
+
+
 def test_sync_endpoints_drops_records_with_neither_mac_nor_ip(queries, mock_client):
     mock_client.query.return_value = _hal([], 0)
     result = queries.sync_endpoints(
