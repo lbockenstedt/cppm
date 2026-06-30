@@ -64,6 +64,14 @@ class CPPMQueries:
     # search dropdown's responsiveness; raise if a deployment needs deeper reach.
     SEARCH_SCAN_CAP = 5000
 
+    # Larger cap for the scheduled endpoint sync's IP→MAC resolution scans —
+    # correctness over latency (the sync runs on a schedule, not per keystroke).
+    # A static-IP device whose endpoint sorts toward the tail of a large
+    # inventory was missed under SEARCH_SCAN_CAP; this scans deep enough to find
+    # it, and each scan logs scanned-vs-total so a cap hit (or a small inventory
+    # where .62 genuinely isn't present) is visible.
+    SYNC_SCAN_CAP = 200000
+
     # An endpoint's IP can live under varying attribute names depending on the
     # profiler / sync path (``IP Address``, ``Framed-IP-Address``, a vendor-
     # specific name, …). The REST ``filter`` only matches the first-class
@@ -296,17 +304,21 @@ class CPPMQueries:
         (``IP Address`` etc.) is missed. This scan finds it so its MAC can be
         reused and the endpoint tagged for the tenant.
 
-        Stops early once every requested IP is resolved or ``SEARCH_SCAN_CAP``
-        is hit. Best-effort: a CPPM paging failure returns whatever resolved so
-        far (the sync then skips the unresolved IPs as before)."""
+        Stops early once every requested IP is resolved or ``SYNC_SCAN_CAP`` is
+        hit. Best-effort: a CPPM paging failure returns whatever resolved so far
+        (the sync then skips the unresolved IPs as before). Logs scanned-vs-total
+        so a cap hit (or a small inventory where the IP genuinely isn't present)
+        is distinguishable from a real miss."""
         resolved: Dict[str, Dict[str, Any]] = {}
         wanted = {str(ip).strip() for ip in target_ips if str(ip).strip()}
         if not wanted:
             return resolved
+        cap = self.SYNC_SCAN_CAP
         limit = 1000
         offset = 0
         scanned = 0
-        while scanned < self.SEARCH_SCAN_CAP:
+        total = 0
+        while scanned < cap:
             ep_r = self.client.query("/api/endpoint", params={
                 "limit": limit, "offset": offset, "calculate_count": "true"})
             if isinstance(ep_r, dict) and ep_r.get("status") == "ERROR":
@@ -320,12 +332,17 @@ class CPPMQueries:
                     if ip in wanted and ip not in resolved:
                         resolved[ip] = ep
             scanned += len(items)
-            count = ep_r.get("count", 0) if isinstance(ep_r, dict) else 0
+            total = ep_r.get("count", total) if isinstance(ep_r, dict) else total
             offset += limit
-            if len(items) < limit or offset >= count:
+            if len(items) < limit or offset >= total:
                 break
             if all(ip in resolved for ip in wanted):
                 break
+        logger.info("endpoint IP-map scan: scanned %d of %d endpoints (cap %d, %s); "
+                    "resolved %d of %d wanted IPs",
+                    scanned, total, cap,
+                    "CAPPED — raise SYNC_SCAN_CAP" if scanned >= cap else "complete",
+                    len(resolved), len(wanted))
         return resolved
 
     def _build_session_ip_mac_map(self, target_ips: set) -> Dict[str, str]:
@@ -338,15 +355,18 @@ class CPPMQueries:
 
         Returns IP → normalized MAC. Best-effort: a paging failure returns
         whatever resolved so far. Stops early once every requested IP is resolved
-        or ``SEARCH_SCAN_CAP`` is hit."""
+        or ``SYNC_SCAN_CAP`` is hit. Logs scanned-vs-total so a cap hit (or a
+        small session set where the IP genuinely isn't present) is visible."""
         resolved: Dict[str, str] = {}
         wanted = {str(ip).strip() for ip in target_ips if str(ip).strip()}
         if not wanted:
             return resolved
+        cap = self.SYNC_SCAN_CAP
         limit = 1000
         offset = 0
         scanned = 0
-        while scanned < self.SEARCH_SCAN_CAP:
+        total = 0
+        while scanned < cap:
             s_r = self.client.query("/api/session", params={
                 "limit": limit, "offset": offset, "calculate_count": "true"})
             if isinstance(s_r, dict) and s_r.get("status") == "ERROR":
@@ -368,12 +388,17 @@ class CPPMQueries:
                 if mac:
                     resolved[ip] = mac
             scanned += len(items)
-            count = s_r.get("count", 0) if isinstance(s_r, dict) else 0
+            total = s_r.get("count", total) if isinstance(s_r, dict) else total
             offset += limit
-            if len(items) < limit or offset >= count:
+            if len(items) < limit or offset >= total:
                 break
             if all(ip in resolved for ip in wanted):
                 break
+        logger.info("session IP→MAC scan: scanned %d of %d sessions (cap %d, %s); "
+                    "resolved %d of %d wanted IPs",
+                    scanned, total, cap,
+                    "CAPPED — raise SYNC_SCAN_CAP" if scanned >= cap else "complete",
+                    len(resolved), len(wanted))
         return resolved
 
     def _upsert_endpoint(self, mac: str, ip: str, rec: Dict[str, Any],
