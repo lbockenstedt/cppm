@@ -1,5 +1,6 @@
 from typing import Any, Dict, List, Optional
 from client import CPPMClient
+import datetime as _dt
 import json
 import logging
 import re
@@ -35,6 +36,27 @@ def _nas_port(s: dict) -> str:
 def _nas_port_type(s: dict) -> str:
     """NAS port type (e.g. 'Ethernet', 'Wireless - IEEE 802.11') if reported."""
     return s.get("nasporttype") or s.get("nas_port_type") or ""
+
+
+def _nas_ip(s: dict) -> str:
+    """NAS IP (the switch/controller the session terminated on) for a ClearPass
+    ``/api/session`` record. Distinct from ``_nas_name`` — the name helper only
+    falls back to ``nasipaddress`` when no name is present; this always pulls the
+    IP so the realtime NAC→IPAM reverse sync can model the switch device in
+    NetBox by its IP."""
+    return (s.get("nasipaddress") or s.get("nas_ip_address")
+            or s.get("nas_ip") or "")
+
+
+def _iso_dt(dt) -> str:
+    """CPPM datetime string → ISO 8601 (swaps the space separator for ``T``) so
+    JS ``new Date()`` and our own parsers handle it reliably. ``''`` for absent.
+    Module-level twin of the local ``_iso`` in get_access_tracker /
+    get_device_sessions, lifted so get_recent_sessions can share it."""
+    if not dt:
+        return ""
+    s = str(dt).strip()
+    return s.replace(" ", "T") if " " in s else s
 
 
 class CPPMQueries:
@@ -156,6 +178,68 @@ class CPPMQueries:
             })
         total = result.get("count", len(sessions)) if isinstance(result, dict) else len(sessions)
         return {"status": "SUCCESS", "sessions": sessions, "total": total}
+
+    def get_recent_sessions(self, lookback_minutes: int = 2) -> Dict[str, Any]:
+        """Sessions that started within the last ``lookback_minutes`` (Access
+        Tracker / accounting) — the pull side of the realtime NAC→IPAM reverse
+        sync. The hub loop calls this every ~60s with a 2-minute window so newly
+        authenticated devices flow into NetBox.
+
+        Pages ``/api/session`` filtered by ``acctstarttime >= <now - lookback>``
+        (ISO 8601 UTC; ClearPass accepts ISO strings in ``$gte``, the same shape
+        ``get_auth_logs`` uses). Returns normalized rows ``{mac, ip, nas_ip,
+        nas_name, nas_port, nas_port_type, username, start_time}`` — the fields
+        the NetBox sink needs to create a missing endpoint device + its
+        switch/port topology. Rows with no MAC are dropped (the sink is
+        MAC-keyed). **Not cached** — time-sensitive; the spoke handler bypasses
+        the cache for this command.
+        """
+        try:
+            lookback = int(lookback_minutes)
+        except (TypeError, ValueError):
+            lookback = 2
+        end = _dt.datetime.now(_dt.timezone.utc)
+        start = end - _dt.timedelta(minutes=max(0, lookback))
+        start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+        filt = json.dumps({"acctstarttime": {"$gte": start_iso}},
+                          separators=(",", ":"))
+        sessions: List[Dict[str, Any]] = []
+        total: Any = None
+        limit = 1000
+        offset = 0
+        while True:
+            result = self.client.query("/api/session", params={
+                "calculate_count": "true",
+                "limit": limit, "offset": offset, "filter": filt,
+            })
+            if isinstance(result, dict) and result.get("status") == "ERROR":
+                return result
+            items = self._items(result)
+            for s in items:
+                mac = s.get("callingstation", s.get("mac", ""))
+                if not mac:
+                    continue  # MAC-keyed downstream; nothing to ingest without one
+                sessions.append({
+                    "mac":           mac,
+                    "ip":            s.get("framedipaddress", ""),
+                    "nas_ip":        _nas_ip(s),
+                    "nas_name":      _nas_name(s),
+                    "nas_port":      _nas_port(s),
+                    "nas_port_type": _nas_port_type(s),
+                    "username":      s.get("username", ""),
+                    "start_time":    _iso_dt(s.get("acctstarttime", "")),
+                })
+            if total is None and isinstance(result, dict):
+                total = result.get("count")
+            if len(items) < limit:
+                break
+            offset += limit
+            if isinstance(total, int) and offset >= total:
+                break
+        return {"status": "SUCCESS", "sessions": sessions,
+                "total": len(sessions), "window_start": start_iso,
+                "window_end": end_iso}
 
     # --- Device Database ---
 

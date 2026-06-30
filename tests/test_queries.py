@@ -117,3 +117,53 @@ def test_upsert_endpoint_put_defaults_status_known_when_missing(queries, mock_cl
     assert res == "pushed"
     body = mock_client._request.call_args.kwargs["json"]
     assert body["status"] == "Known"
+
+
+# ── get_recent_sessions (realtime NAC→IPAM reverse-sync pull) ───────────────
+
+def test_get_recent_sessions_filters_by_acctstarttime_and_normalizes(queries, mock_client):
+    """The realtime reverse sync pulls sessions started in the last N minutes.
+    The /api/session filter is acctstarttime $gte <ISO start ~ now-lookback>;
+    rows normalize to {mac, ip, nas_ip, nas_port, ...} and MAC-less rows drop."""
+    import json as _json
+    import datetime as _dt
+    mock_client.query.return_value = {
+        "count": 2,
+        "_embedded": {"items": [
+            {"id": 1, "username": "alice", "callingstation": "AA:BB:CC:DD:EE:01",
+             "framedipaddress": "10.0.0.5", "nasipaddress": "10.0.0.254",
+             "nas_name": "sw-core", "nasportid": "Ethernet1/0/12",
+             "nasporttype": "Ethernet", "acctstarttime": "2026-06-30 10:00:00"},
+            {"id": 2, "username": "", "callingstation": "",  # no MAC → dropped
+             "framedipaddress": "10.0.0.6", "acctstarttime": "2026-06-30 10:00:30"},
+        ]},
+    }
+
+    res = queries.get_recent_sessions(lookback_minutes=2)
+
+    assert res["status"] == "SUCCESS"
+    assert len(res["sessions"]) == 1            # MAC-less row dropped
+    s = res["sessions"][0]
+    assert s["mac"] == "AA:BB:CC:DD:EE:01"
+    assert s["ip"] == "10.0.0.5"
+    assert s["nas_ip"] == "10.0.0.254"
+    assert s["nas_name"] == "sw-core"
+    assert s["nas_port"] == "Ethernet1/0/12"
+    assert s["nas_port_type"] == "Ethernet"
+    assert s["username"] == "alice"
+    assert s["start_time"] == "2026-06-30T10:00:00"   # space → T
+    # Filter is acctstarttime $gte an ISO start ~ now-2min (UTC).
+    params = mock_client.query.call_args.kwargs["params"]
+    filt = _json.loads(params["filter"])
+    assert "acctstarttime" in filt and "$gte" in filt["acctstarttime"]
+    parsed = _dt.datetime.strptime(filt["acctstarttime"]["$gte"], "%Y-%m-%dT%H:%M:%SZ")
+    age = (_dt.datetime.utcnow() - parsed).total_seconds()
+    assert 90 <= age <= 150                       # ~2 minutes lookback
+    assert res["window_start"] == filt["acctstarttime"]["$gte"]
+    assert res["window_end"]
+
+
+def test_get_recent_sessions_propagates_api_error(queries, mock_client):
+    mock_client.query.return_value = {"status": "ERROR", "message": "boom"}
+    res = queries.get_recent_sessions(lookback_minutes=2)
+    assert res["status"] == "ERROR"
