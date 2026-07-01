@@ -167,3 +167,42 @@ def test_get_recent_sessions_propagates_api_error(queries, mock_client):
     mock_client.query.return_value = {"status": "ERROR", "message": "boom"}
     res = queries.get_recent_sessions(lookback_minutes=2)
     assert res["status"] == "ERROR"
+
+
+def test_get_device_sessions_filters_by_callingstationid(queries, mock_client):
+    """ClearPass /api/session 422s on filter key ``callingstation`` ("cannot
+    filter using 'callingstation'"); the filterable field is ``callingstationid``.
+    Lock the corrected key + ClearPass lowercase-colon MAC normalization."""
+    import json as _json
+    mock_client.query.return_value = [
+        {"id": 1, "username": "u", "framedipaddress": "10.0.0.5",
+         "callingstationid": "aa:bb:cc:dd:ee:01",
+         "acctstarttime": "2026-07-01 12:00:00", "state": "active"}]
+    res = queries.get_device_sessions("AA-BB-CC-DD-EE-01")
+    assert res["status"] == "SUCCESS"
+    assert res["total"] == 1
+    assert res["sessions"][0]["ip"] == "10.0.0.5"
+    params = mock_client.query.call_args.kwargs["params"]
+    assert _json.loads(params["filter"]) == {"callingstationid": "aa:bb:cc:dd:ee:01"}
+    # Filtered path — exactly one server call.
+    assert mock_client.query.call_count == 1
+
+
+def test_get_device_sessions_falls_back_to_client_side_scan_on_filter_error(queries, mock_client):
+    """If the server filter errors (field not filterable on this ClearPass build),
+    fall back to a bounded unfiltered scan + client-side separator-insensitive MAC
+    match so the lookup still returns matches — no 422 error storm, no empty."""
+    match = {"id": 7, "framedipaddress": "10.0.0.5",
+             "callingstationid": "aa:bb:cc:dd:ee:01",
+             "acctstarttime": "", "state": "active"}
+    other = {"id": 8, "framedipaddress": "10.0.0.9",
+             "callingstationid": "11:22:33:44:55:66",
+             "acctstarttime": "", "state": "active"}
+    mock_client.query.side_effect = [
+        {"status": "ERROR", "message": "cannot filter using 'callingstationid'"},
+        {"_embedded": {"session": [match, other]}},
+    ]
+    res = queries.get_device_sessions("aabbccddee01", limit=20)
+    assert res["status"] == "SUCCESS"
+    assert len(res["sessions"]) == 1            # only the MAC match, not `other`
+    assert res["sessions"][0]["ip"] == "10.0.0.5"

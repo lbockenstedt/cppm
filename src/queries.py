@@ -894,18 +894,59 @@ class CPPMQueries:
                 "skipped_details": skipped_details}
 
     def get_device_sessions(self, mac: str, limit: int = 20) -> Dict[str, Any]:
-        """Accounting sessions for a specific device by calling station (MAC address)."""
-        result = self.client.query(
-            "/api/session",
-            params={
-                "filter": json.dumps({"callingstation": mac}, separators=(",", ":")),
-                "limit": limit,
-                "calculate_count": "true",
-            },
-        )
+        """Accounting sessions for a specific device by calling station (MAC).
+
+        ClearPass ``/api/session`` rejects ``callingstation`` as a filter key
+        (HTTP 422 "cannot filter using 'callingstation'") — the filterable field
+        is ``callingstationid``. Try that first (fast, server-filtered); if the
+        deployed ClearPass still rejects it (or returns an error), fall back to
+        a bounded unfiltered paged scan + client-side separator-insensitive MAC
+        match — the same pattern the global-search substring scan uses — so the
+        lookup always works and never emits a 422 error storm. On-demand only
+        (device-detail), so the bounded scan cost is acceptable."""
+        norm = self._norm_mac(mac)
+        mac_hex = re.sub(r"[^0-9a-f]", "", norm.lower()) if norm else ""
+
+        def _query_filtered(filter_key: str, value: str):
+            return self.client.query(
+                "/api/session",
+                params={
+                    "filter": json.dumps({filter_key: value}, separators=(",", ":")),
+                    "limit": limit,
+                    "calculate_count": "true",
+                },
+            )
+
+        result = _query_filtered("callingstationid", norm) if norm else None
+        used_fallback = False
         if isinstance(result, dict) and result.get("status") == "ERROR":
-            return result
-        items = self._items(result)
+            # Server filter rejected (e.g. field not filterable on this ClearPass
+            # build) → bounded client-side scan so we still return matches.
+            used_fallback = True
+            items: List[Dict[str, Any]] = []
+            offset = 0
+            page = 500
+            while len(items) < limit:
+                r = self.client.query("/api/session", params={
+                    "limit": page, "offset": offset, "calculate_count": "true"})
+                if isinstance(r, dict) and r.get("status") == "ERROR":
+                    break
+                page_items = self._items(r)
+                if not page_items:
+                    break
+                for s in page_items:
+                    s_hex = re.sub(r"[^0-9a-f]", "",
+                                   (s.get("callingstationid")
+                                    or s.get("callingstation") or "").lower())
+                    if mac_hex and s_hex == mac_hex:
+                        items.append(s)
+                        if len(items) >= limit:
+                            break
+                if len(page_items) < page:
+                    break
+                offset += page
+        else:
+            items = self._items(result)
         def _iso(dt):
             if not dt: return ""
             return str(dt).strip().replace(" ", "T") if " " in str(dt) else str(dt)
@@ -927,7 +968,8 @@ class CPPMQueries:
                 "start_time": _iso(s.get("acctstarttime", "")),
                 "state":     s.get("state", ""),
             })
-        total = result.get("count", len(sessions)) if isinstance(result, dict) else len(sessions)
+        total = (result.get("count", len(sessions))
+                 if isinstance(result, dict) and not used_fallback else len(sessions))
         return {"status": "SUCCESS", "sessions": sessions, "total": total}
 
     def get_user_sessions(self, username: str) -> List[Dict[str, Any]]:
