@@ -20,8 +20,13 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lm-secret" ]; then
-    SPOKE_SECRET=""
-    echo "ℹ️  No pre-shared secret — spoke will connect unauthenticated and await admin approval in the LM WebUI."
+    # Keep the default PSK "lm-secret" (do NOT clear to "") so the =-attached
+    # ExecStart below (--secret=$SPOKE_SECRET) resolves to "lm-secret" at
+    # runtime — matching the prior bare `--secret` argparse const="lm-secret"
+    # zero-touch behavior. Clearing to "" would make `--secret=` pass an empty
+    # string (pending negotiation) instead of the default-PSK path.
+    SPOKE_SECRET="lm-secret"
+    echo "ℹ️  No pre-shared secret — spoke will connect with the default PSK 'lm-secret' (zero-touch; the hub auto-approves the default PSK or awaits admin approval in the LM WebUI)."
 fi
 
 echo "🚀 Installing ClearPass Policy Manager (CPPM) Module (Native)..."
@@ -95,7 +100,7 @@ User=svc_lm
 WorkingDirectory=$INSTALL_DIR/cppm
 EnvironmentFile=$INSTALL_DIR/cppm/.env
 Environment="PYTHONPATH=$INSTALL_DIR:$INSTALL_DIR/core/src:$INSTALL_DIR/cppm/src"
-ExecStart=$INSTALL_DIR/cppm/venv/bin/python3 -m src.control_plane --id \$SPOKE_ID --secret \$SPOKE_SECRET --hub \$HUB_URL --hub-secret \$HUB_SECRET
+ExecStart=$INSTALL_DIR/cppm/venv/bin/python3 -m src.control_plane --id \$SPOKE_ID --secret=\$SPOKE_SECRET --hub \$HUB_URL --hub-secret=\$HUB_SECRET
 StandardOutput=append:/var/log/lm/lm-cppm.log
 StandardError=append:/var/log/lm/lm-cppm.log
 Restart=always
