@@ -139,7 +139,12 @@ class CPPMSpoke:
 
         # Cached commands
         CACHED = {"CPPM_GET_ACCESS_TRACKER", "CPPM_GET_DEVICE_DATABASE", "CPPM_GET_NAC_STATUS"}
-        if normalized in CACHED and normalized in self._cache:
+        # Serve from cache ONLY for a default query. The cache is keyed by command
+        # NAME (refresh_cache primes it with defaults), so returning it for a
+        # paged/filtered request (limit/offset/status) would hand back the cached
+        # default page/filter — a request for page 2 or status="Unknown" must go live.
+        _default_query = not any(k in data for k in ("limit", "offset", "status"))
+        if normalized in CACHED and _default_query and normalized in self._cache:
             return self._cache[normalized]
 
         if normalized == "CPPM_GET_ACCESS_TRACKER":
