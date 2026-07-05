@@ -54,7 +54,7 @@ cd "$INSTALL_DIR"
 
 if [ -d "cppm/.git" ]; then
     echo "📂 CPPM repository already exists. Updating..."
-    cd cppm && git pull && cd ..
+    cd cppm && git fetch origin -q && git reset --hard origin/main && cd ..   # hard-sync (soft `git pull` no-ops on a diverged/detached clone)
 else
     echo "🌐 Cloning CPPM Manager repository..."
     git clone https://github.com/lbockenstedt/cppm.git
