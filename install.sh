@@ -2,7 +2,7 @@
 set -e
 
 # Default Configuration
-HUB_URL="ws://localhost:8765"
+HUB_URL="auto"   # was ws://localhost:8765 (retired bare listener); auto-discover the unified :443 hub
 SPOKE_ID="${SPOKE_ID:-cppm-$(hostname -s)}"
 SPOKE_SECRET="lm-secret"
 
@@ -49,6 +49,7 @@ if [ -d "$OLD_INSTALL_DIR" ]; then
 fi
 
 mkdir -p "$INSTALL_DIR"
+mkdir -p /var/log/lm   # systemd `append:` won't create the parent dir → unit 206/EXEC on a clean box
 cd "$INSTALL_DIR"
 
 if [ -d "cppm/.git" ]; then
