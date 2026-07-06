@@ -50,6 +50,23 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 mkdir -p /var/log/lm   # systemd `append:` won't create the parent dir → unit 206/EXEC on a clean box
+
+# Circular logging: cap /var/log/lm/*.log so it can't fill the disk (copytruncate
+# keeps the inode → the running spoke's O_APPEND FileHandler + systemd stderr
+# keep appending). Belt-and-suspenders alongside logging_setup's RotatingFileHandler.
+cat > /etc/logrotate.d/lm <<'LOGROTATE'
+/var/log/lm/*.log /var/log/client-sim-*.log {
+    su root root
+    size 50M
+    rotate 5
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+LOGROTATE
+
 cd "$INSTALL_DIR"
 
 if [ -d "cppm/.git" ]; then
