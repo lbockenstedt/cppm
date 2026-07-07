@@ -1,5 +1,6 @@
 from typing import Any, Dict, List, Optional
 from client import CPPMClient
+import concurrent.futures
 import datetime as _dt
 import json
 import logging
@@ -286,16 +287,24 @@ class CPPMQueries:
         ``acctstoptime``); without this filter ClearPass returns every session
         ever recorded and the count grows monotonically."""
         active_filter = json.dumps({"acctstoptime": {"$exists": False}}, separators=(",", ":"))
-        sessions_result = self.client.query("/api/session", params={"calculate_count": "true", "limit": 1, "filter": active_filter})
-        devices_result = self.client.query("/api/endpoint", params={"calculate_count": "true", "limit": 1})
-        known_result = self.client.query(
-            "/api/endpoint",
-            params={"calculate_count": "true", "limit": 1, "filter": '{"status":"Known"}'},
-        )
-        unknown_result = self.client.query(
-            "/api/endpoint",
-            params={"calculate_count": "true", "limit": 1, "filter": '{"status":"Unknown"}'},
-        )
+        # Four independent count queries were issued serially (4 sequential
+        # HTTP RTTs). requests.Session is sync, so run them in a 4-thread pool
+        # to overlap the RTTs; the shared client.session is safe for concurrent
+        # reads (requests.Session is not guaranteed thread-safe for writes,
+        # but these are plain GETs with no header mutation between them).
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            fut_sessions = pool.submit(self.client.query, "/api/session",
+                                       params={"calculate_count": "true", "limit": 1, "filter": active_filter})
+            fut_devices = pool.submit(self.client.query, "/api/endpoint",
+                                      params={"calculate_count": "true", "limit": 1})
+            fut_known = pool.submit(self.client.query, "/api/endpoint",
+                                    params={"calculate_count": "true", "limit": 1, "filter": '{"status":"Known"}'})
+            fut_unknown = pool.submit(self.client.query, "/api/endpoint",
+                                      params={"calculate_count": "true", "limit": 1, "filter": '{"status":"Unknown"}'})
+            sessions_result = fut_sessions.result()
+            devices_result = fut_devices.result()
+            known_result = fut_known.result()
+            unknown_result = fut_unknown.result()
         return {
             "status": "SUCCESS",
             "active_sessions": sessions_result.get("count", 0) if isinstance(sessions_result, dict) else 0,

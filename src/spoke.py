@@ -4,6 +4,7 @@ from queries import CPPMQueries
 from client import CPPMClient
 import os
 import logging
+import time
 
 logger = logging.getLogger("CPPMSpoke")
 
@@ -28,6 +29,12 @@ class CPPMSpoke:
         self.client = CPPMClient()
         self.queries = CPPMQueries(self.client)
         self._cache: Dict[str, Any] = {}
+        # Per-command refresh timestamps so the cache can expire. Without a
+        # TTL, _cache was populated only by an explicit CPPM_REFRESH_CACHE and
+        # served indefinitely; a 60s TTL bounds staleness so a stale default
+        # page can't be handed back indefinitely between refreshes.
+        self._cache_ts: Dict[str, float] = {}
+        self._cache_ttl = 60.0
 
     def get_version(self) -> str:
         try:
@@ -55,6 +62,7 @@ class CPPMSpoke:
                 res = await asyncio.get_event_loop().run_in_executor(None, method)
                 if isinstance(res, dict) and res.get("status") == "SUCCESS":
                     self._cache[cmd] = res
+                    self._cache_ts[cmd] = time.time()
                     results[cmd] = "OK"
                 else:
                     results[cmd] = f"Error: {res.get('message') if isinstance(res, dict) else res}"
@@ -91,9 +99,11 @@ class CPPMSpoke:
             results = []
             client = self.client
             base = client._base_url()
-            import requests as _req
-            session = _req.Session()
-            session.verify = False
+            # Reuse the client's long-lived keep-alive Session instead of
+            # building a fresh requests.Session (new TCP pool) per TEST_AUTH —
+            # the client session already has verify=False and an OAuth token
+            # path configured; the probe posts grant-specific bodies below.
+            session = client.session
             candidates = []
             if client.client_id and client.client_secret:
                 candidates.append({"grant_type": "client_credentials",
@@ -144,7 +154,8 @@ class CPPMSpoke:
         # paged/filtered request (limit/offset/status) would hand back the cached
         # default page/filter — a request for page 2 or status="Unknown" must go live.
         _default_query = not any(k in data for k in ("limit", "offset", "status"))
-        if normalized in CACHED and _default_query and normalized in self._cache:
+        if (normalized in CACHED and _default_query and normalized in self._cache
+                and (time.time() - self._cache_ts.get(normalized, 0)) < self._cache_ttl):
             return self._cache[normalized]
 
         if normalized == "CPPM_GET_ACCESS_TRACKER":
