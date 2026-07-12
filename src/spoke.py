@@ -263,5 +263,28 @@ class CPPMSpoke:
                 ),
             )
 
+        if normalized == "INSTALL_CERT":
+            # Hub-brokered cert distribution: install the delivered LE cert as
+            # a ClearPass server cert. Default service is HTTPS(RSA) (the admin
+            # WebUI cert); the caller may target RADIUS/RadSec/HTTPS(ECC) via
+            # ``service_name``. Runs in an executor because import_cert uses
+            # synchronous requests + a short-lived HTTP server to host the
+            # PKCS12 bundle ClearPass fetches. See CPPMQueries.import_cert.
+            fullchain = (data.get("fullchain") or "")
+            privkey = (data.get("privkey") or "")
+            chain = (data.get("chain") or "")
+            domain = (data.get("domain") or "")
+            service = (data.get("service_name") or data.get("service")
+                       or "HTTPS(RSA)")
+            if not fullchain or not privkey:
+                return {"status": "ERROR",
+                        "message": "INSTALL_CERT requires fullchain + privkey"}
+            return await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.queries.import_cert(
+                    fullchain=fullchain, privkey=privkey, domain=domain,
+                    service_name=service, chain=chain),
+            )
+
         logger.warning(f"Unknown CPPM command: {cmd_type}")
         return {"status": "ERROR", "message": f"Unknown command: {cmd_type}"}

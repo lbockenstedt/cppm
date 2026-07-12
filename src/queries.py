@@ -60,6 +60,32 @@ def _iso_dt(dt) -> str:
     return s.replace(" ", "T") if " " in s else s
 
 
+def _make_p12_handler(p12_bytes: bytes):
+    """Build a one-shot ``http.server`` handler that serves ``p12_bytes`` at
+    ``/bundle.p12`` (404 elsewhere). Used by :meth:`CPPMQueries.import_cert`
+    to host the PKCS#12 bundle ClearPass fetches during the PUT — the server
+    lives only for the duration of that PUT call. The handler silences its
+    own request logging (the spoke log already records the install step)."""
+    import http.server
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
+            if self.path.split("?", 1)[0] == "/bundle.p12":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-pkcs12")
+                self.send_header("Content-Length", str(len(p12_bytes)))
+                self.end_headers()
+                self.wfile.write(p12_bytes)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, *args):  # silence per-request stderr noise
+            pass
+
+    return _Handler
+
+
 class CPPMQueries:
     """
     High-level interface for querying ClearPass Policy Manager.
@@ -1160,3 +1186,207 @@ class CPPMQueries:
         if isinstance(result, dict) and result.get("status") != "ERROR":
             return {"status": "SUCCESS", "version": result.get("app_major_version", ""), "details": result}
         return {"status": "ERROR", "message": result.get("message", "Unreachable")}
+
+    # ── Cert install (INSTALL_CERT) ──────────────────────────────────────────
+    # ClearPass's server-cert API does NOT accept inline PEM — it fetches a
+    # PKCS#12 bundle from a URL we hand it, so import_cert converts PEM→p12,
+    # stands up a short-lived HTTP server on a ClearPass-reachable address
+    # serving the p12, discovers the cluster server UUID, then PUTs the p12 URL
+    # + passphrase to /api/server-cert/name/{uuid}/{service}. The HTTP server
+    # is torn down the moment the PUT returns. No restart is needed for HTTPS
+    # services. The spoke's INSTALL_CERT handler runs this in an executor
+    # (CPPMQueries is synchronous requests-based).
+
+    @staticmethod
+    def _build_pkcs12(fullchain_pem: str, privkey_pem: str, passphrase: str) -> bytes:
+        """Modern PKCS#12 (AES-256-CBC + SHA-256 HMAC) via ``cryptography``.
+
+        Preferred bundle shape — readable by current ClearPass builds. Raises
+        if ``cryptography`` isn't installed or the PEM is invalid; the caller
+        falls back to :meth:`_build_pkcs12_legacy` on any failure (older
+        ClearPass builds that can't read modern p12)."""
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import (
+            pkcs12, BestAvailableEncryption, load_pem_private_key,
+        )
+        key = load_pem_private_key(privkey_pem.encode(), password=None)
+        certs = x509.load_pem_x509_certificates(fullchain_pem.encode())
+        if not certs:
+            raise ValueError("no certificates parsed from fullchain PEM")
+        return pkcs12.serialize_key_and_certificates(
+            name=(f"lm-le-cert").encode(),
+            key=key,
+            cert=certs[0],
+            cas=certs[1:] if len(certs) > 1 else None,
+            encryption_algorithm=BestAvailableEncryption(passphrase.encode()),
+        )
+
+    @staticmethod
+    def _build_pkcs12_legacy(fullchain_pem: str, privkey_pem: str,
+                             passphrase: str) -> bytes:
+        """Legacy PKCS#12 (RC2-40 + SHA-1) via the ``openssl`` CLI ``-legacy``
+        flag — the bundle shape older ClearPass builds expect. Used when the
+        modern bundle is rejected. ``-legacy`` is OpenSSL 3.x only; on older
+        OpenSSL (1.x, where legacy is the default and the flag is unknown) we
+        retry without it. Raises ``RuntimeError`` on openssl absence/failure."""
+        import os
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            certf = os.path.join(td, "fullchain.pem")
+            keyf = os.path.join(td, "privkey.pem")
+            p12f = os.path.join(td, "bundle.p12")
+            with open(certf, "w") as f:
+                f.write(fullchain_pem)
+            with open(keyf, "w") as f:
+                f.write(privkey_pem)
+
+            def _run(extra):
+                return subprocess.run(
+                    ["openssl", "pkcs12", "-export"] + extra +
+                    ["-in", certf, "-inkey", keyf, "-out", p12f,
+                     "-passout", f"pass:{passphrase}"],
+                    check=False, capture_output=True, timeout=30,
+                )
+            try:
+                cp = _run(["-legacy"])
+            except FileNotFoundError:
+                raise RuntimeError(
+                    "openssl CLI not found — needed for legacy PKCS#12 build")
+            stderr = cp.stderr or b""
+            if cp.returncode != 0 and (b"Invalid option" in stderr
+                                       or b"unknown option" in stderr
+                                       or b"unrecognized option" in stderr):
+                # Older OpenSSL: legacy algorithms are the default and -legacy
+                # isn't recognized — retry without it.
+                cp = _run([])
+            if cp.returncode != 0:
+                raise RuntimeError(
+                    "openssl pkcs12 failed: " + stderr.decode(errors="replace")[:300])
+            with open(p12f, "rb") as f:
+                return f.read()
+
+    def _cluster_server_uuid(self) -> str:
+        """Discover the ClearPass cluster server UUID via
+        ``GET /api/cluster/server``. Returns the first server's ``uuid``
+        (falling back to ``id``). Raises ``RuntimeError`` with the API detail
+        on failure so import_cert can surface a precise ERROR."""
+        srv = self.client.query("/api/cluster/server")
+        if isinstance(srv, dict) and srv.get("status") == "ERROR":
+            raise RuntimeError(f"GET /api/cluster/server failed: {srv.get('message')}")
+        items = self._items(srv)
+        if not items:
+            raise RuntimeError("no cluster servers returned by /api/cluster/server")
+        return items[0].get("uuid") or items[0].get("id") or ""
+
+    def import_cert(self, fullchain: str, privkey: str, domain: str = "",
+                    service_name: str = "HTTPS(RSA)",
+                    chain: str = "") -> Dict[str, Any]:
+        """Install a CA-signed cert (LE fullchain + key) into ClearPass as the
+        named service's server cert — default the admin WebUI ``HTTPS(RSA)``
+        cert. See the class-level notes above for the host-and-fetch flow.
+
+        ``LM_CPPM_P12_HOST`` (required) is THIS spoke's address as ClearPass
+        sees it — the p12 URL ClearPass fetches is built from it, so it must be
+        reachable from the ClearPass node. ``LM_CPPM_P12_PORT`` (default 0 =
+        ephemeral) fixes the port if your firewall mandates one.
+
+        PEM→p12 prefers the modern bundle via ``cryptography``; if ClearPass
+        rejects it (older builds), we regenerate with ``openssl -legacy`` and
+        retry the PUT once. Returns the ``CPPMClient._request`` shape
+        (``{status, message}``)."""
+        fullchain = fullchain or ""
+        privkey = privkey or ""
+        if not fullchain or "BEGIN CERTIFICATE" not in fullchain:
+            return {"status": "ERROR",
+                    "message": "invalid or empty fullchain PEM for cert install"}
+        if not privkey or "PRIVATE KEY" not in privkey:
+            return {"status": "ERROR",
+                    "message": "invalid or empty privkey PEM for cert install"}
+
+        import os
+        import secrets
+        url_host = os.getenv("LM_CPPM_P12_HOST", "").strip()
+        if not url_host:
+            return {"status": "ERROR",
+                    "message": "LM_CPPM_P12_HOST not set — set it to this spoke's "
+                               "IP as ClearPass sees it so ClearPass can fetch the "
+                               "PKCS12 bundle over HTTP"}
+        try:
+            bind_port = int(os.getenv("LM_CPPM_P12_PORT", "0") or 0)
+        except ValueError:
+            bind_port = 0
+        passphrase = secrets.token_urlsafe(18)
+        service_name = service_name or "HTTPS(RSA)"
+
+        # Build modern p12; fall back to legacy immediately if the modern
+        # builder is unavailable (no cryptography / bad PEM).
+        used_legacy = False
+        try:
+            p12 = self._build_pkcs12(fullchain, privkey, passphrase)
+        except Exception as e:
+            logger.warning("modern PKCS12 build failed (%s) — using openssl -legacy", e)
+            try:
+                p12 = self._build_pkcs12_legacy(fullchain, privkey, passphrase)
+                used_legacy = True
+            except Exception as e2:
+                return {"status": "ERROR",
+                        "message": f"PKCS12 build failed: {e2}"}
+
+        try:
+            server_uuid = self._cluster_server_uuid()
+        except RuntimeError as e:
+            return {"status": "ERROR", "message": str(e)}
+        if not server_uuid:
+            return {"status": "ERROR",
+                    "message": "cluster server has no uuid/id (cannot address PUT)"}
+
+        import http.server
+        import threading
+
+        def _put_with(bundle: bytes) -> Dict[str, Any]:
+            handler = _make_p12_handler(bundle)
+            srv = http.server.ThreadingHTTPServer(("0.0.0.0", bind_port), handler)
+            port = srv.server_address[1]
+            thread = threading.Thread(target=srv.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://{url_host}:{port}/bundle.p12"
+                return self.client._request(
+                    "PUT",
+                    f"/api/server-cert/name/{server_uuid}/{service_name}",
+                    json={"pkcs12_file_url": url, "pkcs12_passphrase": passphrase},
+                )
+            finally:
+                try:
+                    srv.shutdown()
+                    srv.server_close()
+                except Exception:
+                    pass
+                thread.join(timeout=5)
+
+        res = _put_with(p12)
+        # If ClearPass couldn't read the modern p12, retry once with the legacy
+        # bundle (old builds need RC2/SHA-1). Match ONLY on p12-parse/read
+        # markers — a "URL not trusted" / "could not fetch" 422 is a URL-reach
+        # problem (retrying with a different bundle won't help) so it surfaces
+        # as a plain ERROR without burning the legacy retry.
+        if (isinstance(res, dict) and res.get("status") == "ERROR"
+                and not used_legacy):
+            body_txt = str(res.get("message", "")).lower()
+            if any(k in body_txt for k in
+                   ("pkcs12", "p12", "parse", "empty", "mac", "decrypt",
+                    "unsupported")):
+                logger.warning("modern p12 rejected by ClearPass (%s) — retrying "
+                               "with openssl -legacy", res.get("message"))
+                try:
+                    p12_leg = self._build_pkcs12_legacy(fullchain, privkey, passphrase)
+                    res = _put_with(p12_leg)
+                except Exception as e:
+                    logger.warning("legacy p12 build failed: %s", e)
+
+        if isinstance(res, dict) and res.get("status") == "ERROR":
+            return res
+        return {"status": "SUCCESS",
+                "message": f"cert '{domain or 'lm-le'}' installed as {service_name} "
+                           f"on ClearPass server {server_uuid}"}
