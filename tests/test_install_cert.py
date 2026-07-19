@@ -128,6 +128,11 @@ def test_install_cert_handler_missing_material_is_error():
 
 def test_import_cert_missing_p12_host_is_error(monkeypatch):
     monkeypatch.delenv("LM_CPPM_P12_HOST", raising=False)
+    # Force auto-detection to fail so the unset-env ERROR path is exercised
+    # (on a host with a default route _detect_local_ipv4 would otherwise
+    # supply a host and proceed past the gate).
+    import src.queries as qmod
+    monkeypatch.setattr(qmod, "_detect_local_ipv4", lambda: "")
     mock_client = MagicMock(spec=CPPMClient)
     q = _queries_with_cluster(mock_client)
     fullchain, privkey = _real_pair()
@@ -138,6 +143,26 @@ def test_import_cert_missing_p12_host_is_error(monkeypatch):
     assert "LM_CPPM_P12_HOST" in res["message"]
     # Never reached the REST calls.
     mock_client._request.assert_not_called()
+
+
+def test_import_cert_auto_detects_p12_host(monkeypatch):
+    """Unset LM_CPPM_P12_HOST + a reachable default route → auto-detect the
+    source IP and proceed to the PUT (no manual env needed)."""
+    monkeypatch.delenv("LM_CPPM_P12_HOST", raising=False)
+    import src.queries as qmod
+    monkeypatch.setattr(qmod, "_detect_local_ipv4", lambda: "10.0.0.5")
+    mock_client = MagicMock(spec=CPPMClient)
+    mock_client._request.return_value = {"status": "SUCCESS", "message": "ok"}
+    q = _queries_with_cluster(mock_client)
+    fullchain, privkey = _real_pair()
+
+    res = q.import_cert(fullchain=fullchain, privkey=privkey, domain="a.example.com")
+
+    assert res["status"] == "SUCCESS"
+    # The PUT URL host is the auto-detected IP.
+    put_call = mock_client._request.call_args
+    url = put_call.kwargs["json"]["pkcs12_file_url"]
+    assert url.startswith("http://10.0.0.5:")
 
 
 def test_import_cert_invalid_pem_is_error(monkeypatch):

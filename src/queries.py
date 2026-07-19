@@ -86,6 +86,28 @@ def _make_p12_handler(p12_bytes: bytes):
     return _Handler
 
 
+def _detect_local_ipv4() -> str:
+    """Best-effort primary outbound IPv4 of this host, for ClearPass to fetch
+    the PKCS12 bundle when ``LM_CPPM_P12_HOST`` is unset. Uses the UDP-connect
+    trick (no packets sent) to find the source IP of the default route — the
+    address ClearPass most likely reaches when the spoke shares its routed
+    network. Returns ``""`` on failure; the caller still requires a non-empty
+    host so a failed detection surfaces the actionable ERROR (set the env)."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("223.255.255.1", 1))  # RFC 5737 — never routed
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+        finally:
+            s.close()
+    except Exception:
+        pass
+    return ""
+
+
 class CPPMQueries:
     """
     High-level interface for querying ClearPass Policy Manager.
@@ -1308,10 +1330,20 @@ class CPPMQueries:
         import secrets
         url_host = os.getenv("LM_CPPM_P12_HOST", "").strip()
         if not url_host:
+            # Auto-detect the host's primary outbound IPv4 so cert distribution
+            # works without manual env config on a routed shared network. The
+            # explicit env stays authoritative when the spoke is multi-homed on
+            # a segment ClearPass can't reach via the default route.
+            url_host = _detect_local_ipv4()
+            if url_host:
+                logger.info("LM_CPPM_P12_HOST unset — auto-detected %s "
+                            "(override via LM_CPPM_P12_HOST if ClearPass can't "
+                            "reach it)", url_host)
+        if not url_host:
             return {"status": "ERROR",
-                    "message": "LM_CPPM_P12_HOST not set — set it to this spoke's "
-                               "IP as ClearPass sees it so ClearPass can fetch the "
-                               "PKCS12 bundle over HTTP"}
+                    "message": "LM_CPPM_P12_HOST not set and could not auto-detect "
+                               "this spoke's IP — set it to the address ClearPass "
+                               "sees so ClearPass can fetch the PKCS12 bundle"}
         try:
             bind_port = int(os.getenv("LM_CPPM_P12_PORT", "0") or 0)
         except ValueError:
