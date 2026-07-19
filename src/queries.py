@@ -108,6 +108,54 @@ def _detect_local_ipv4() -> str:
     return ""
 
 
+def _split_pem_certs(pem_text: str) -> list:
+    """Split a PEM bundle into its individual ``BEGIN/END CERTIFICATE`` blocks,
+    preserving the delimiters. Tolerant of CRLF and surrounding text (keys,
+    comments). Used to separate the leaf from its issuing CAs."""
+    blocks = []
+    if not pem_text or "BEGIN CERTIFICATE" not in pem_text:
+        return blocks
+    for part in pem_text.replace("\r", "").split("-----END CERTIFICATE-----"):
+        i = part.find("-----BEGIN CERTIFICATE-----")
+        if i < 0:
+            continue
+        body = part[i:]
+        if not body.endswith("\n"):
+            body += "\n"
+        blocks.append(body + "-----END CERTIFICATE-----\n")
+    return blocks
+
+
+def _ca_certs_to_trust(fullchain: str, chain: str) -> list:
+    """Return the CA certs (intermediates + root) to add to ClearPass's
+    Certificate Trust List, as PEM strings. Prefers the explicit ``chain``
+    (CA chain, no leaf); otherwise derives from ``fullchain`` by skipping the
+    first cert (the leaf). ClearPass 422's a third-party-CA-signed server
+    cert until the issuing root CA is imported AND enabled in the CTL —
+    these are the CAs the leaf chains up to."""
+    if chain and "BEGIN CERTIFICATE" in chain:
+        return _split_pem_certs(chain)
+    blocks = _split_pem_certs(fullchain)
+    return blocks[1:] if len(blocks) > 1 else []
+
+
+def _cert_subject_cn(pem: str) -> str:
+    """Best-effort Common Name from a PEM cert, for idempotency matching +
+    diagnostics. Returns ``""`` on any parse failure (the caller treats an
+    empty CN as 'unknown' and still POSTs)."""
+    try:
+        from cryptography import x509
+        certs = x509.load_pem_x509_certificates(pem.encode())
+        if certs:
+            attrs = certs[0].subject.get_attributes_for_oid(
+                x509.oid.NameOID.COMMON_NAME)
+            if attrs:
+                return str(attrs[0].value)
+    except Exception:
+        pass
+    return ""
+
+
 class CPPMQueries:
     """
     High-level interface for querying ClearPass Policy Manager.
@@ -1313,6 +1361,84 @@ class CPPMQueries:
                     return uid
         return _uuid_of(items[0])
 
+    def _ensure_trust_list_cas(self, fullchain: str, chain: str) -> list:
+        """Import+enable the leaf's issuing CAs into ClearPass's Certificate
+        Trust List so ClearPass accepts a third-party-CA-signed server cert.
+
+        ClearPass 422's ``server-cert/name/.../HTTPS(RSA)`` with
+        ``Certificate CA "CN=ISRG Root X1,..." ... must be added and enabled
+        in Certificate Trust List`` until the issuing root CA (and ideally the
+        intermediate) is imported AND enabled in the CTL. This is run BEFORE
+        the server-cert PUT so the PUT can succeed first time.
+
+        Best-effort and NON-BLOCKING: each CA is added independently, and a
+        CTL failure never aborts the server-cert PUT — if the CTL shape is off
+        the PUT still runs and surfaces the real 422 (the diagnostic), so this
+        can't become a new blocker. Idempotent by subject CN: GET the list
+        once, skip CAs already present (PATCH-enable them), POST the rest.
+        Returns a per-CA result list for the caller's envelope/log."""
+        cas = _ca_certs_to_trust(fullchain, chain)
+        if not cas:
+            return []
+
+        # One GET to index existing CTL entries by subject CN (best-effort —
+        # the list item's CN field name isn't documented, so try several).
+        existing: Dict[str, Any] = {}
+        try:
+            lst = self.client.query("/api/cert-trust-list")
+            for it in self._items(lst):
+                if not isinstance(it, dict):
+                    continue
+                cn = (it.get("subject_common_name") or it.get("subject_cn")
+                      or it.get("cn") or it.get("name") or "")
+                cn = str(cn).strip() if cn else ""
+                if cn:
+                    existing[cn] = it.get("id")
+        except Exception as e:
+            logger.warning("trust-list GET failed (%s) — proceeding with blind "
+                           "POST (no idempotency index)", e)
+
+        results = []
+        for pem in cas:
+            cn = _cert_subject_cn(pem) or "<unknown>"
+            if cn in existing:
+                # Already trusted — ensure it's enabled (PATCH), don't re-POST.
+                tid = existing.get(cn)
+                enabled = True
+                if tid is not None:
+                    try:
+                        self.client._request(
+                            "PATCH", f"/api/cert-trust-list/{tid}",
+                            json={"enabled": True})
+                    except Exception as e:
+                        enabled = False
+                        logger.warning("trust-list PATCH-enable %s failed: %s", cn, e)
+                results.append({"ca": cn, "action": "already-trusted",
+                                "enabled": enabled})
+                continue
+            try:
+                r = self.client._request(
+                    "POST", "/api/cert-trust-list",
+                    json={"cert_file": pem, "cert_usage": ["Others"],
+                          "enabled": True})
+            except Exception as e:
+                logger.warning("trust-list POST %s failed: %s", cn, e)
+                results.append({"ca": cn, "action": "error",
+                                "message": str(e)[:160]})
+                continue
+            st = (r or {}).get("status", "ERROR") if isinstance(r, dict) else "ERROR"
+            msg = str((r or {}).get("message", "") or "") if isinstance(r, dict) else ""
+            # A duplicate/conflict (CA already trusted under a usage we didn't
+            # match) is fine — the CA is present, which is all the PUT requires.
+            low = msg.lower()
+            if st == "ERROR" and any(k in low for k in
+                                     ("exist", "duplicate", "already")):
+                results.append({"ca": cn, "action": "already-trusted"})
+            else:
+                results.append({"ca": cn, "action": "added", "status": st,
+                                "message": msg[:160]})
+        return results
+
     def import_cert(self, fullchain: str, privkey: str, domain: str = "",
                     service_name: str = "HTTPS(RSA)",
                     chain: str = "") -> Dict[str, Any]:
@@ -1385,6 +1511,20 @@ class CPPMQueries:
             return {"status": "ERROR",
                     "message": "cluster server has no uuid/id (cannot address PUT)"}
 
+        # Import+enable the issuing CAs in ClearPass's Certificate Trust List
+        # BEFORE the server-cert PUT — ClearPass 422's the PUT until the root
+        # CA is trusted. Best-effort + non-blocking: a CTL failure surfaces as
+        # a logged result + the same PUT 422 (diagnostic), never a new blocker.
+        try:
+            trust_results = self._ensure_trust_list_cas(fullchain, chain)
+            if trust_results:
+                logger.info("ClearPass CTL: %s", trust_results)
+        except Exception as e:
+            trust_results = [{"ca": "<ctl>", "action": "error",
+                              "message": str(e)[:160]}]
+            logger.warning("ClearPass CTL pre-step failed (%s) — PUT still "
+                           "attempted", e)
+
         import http.server
         import threading
 
@@ -1430,7 +1570,9 @@ class CPPMQueries:
                     logger.warning("legacy p12 build failed: %s", e)
 
         if isinstance(res, dict) and res.get("status") == "ERROR":
+            res["trust_list"] = trust_results
             return res
         return {"status": "SUCCESS",
                 "message": f"cert '{domain or 'lm-le'}' installed as {service_name} "
-                           f"on ClearPass server {server_uuid}"}
+                           f"on ClearPass server {server_uuid}",
+                "trust_list": trust_results}

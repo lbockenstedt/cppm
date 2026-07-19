@@ -284,3 +284,218 @@ def test_import_cert_put_error_surfaces(monkeypatch):
     assert "URL not trusted" in res["message"]
     # No legacy retry — only one PUT.
     assert mock_client._request.call_count == 1
+
+
+# ── Certificate Trust List (CTL) auto-import ─────────────────────────────────
+# ClearPass 422's a third-party-CA-signed server cert until the issuing root CA
+# is imported AND enabled in the CTL. import_cert runs _ensure_trust_list_cas
+# BEFORE the server-cert PUT; it's best-effort + non-blocking (a CTL failure
+# never aborts the PUT) and idempotent by subject CN.
+def _real_chain():
+    """A leaf cert + an issuing CA cert (both self-signed for the test). Returns
+    (fullchain_pem, chain_pem, leaf_cn, ca_cn, privkey)."""
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+        import datetime
+    except Exception:
+        pytest.skip("cryptography not installed")
+    now = datetime.datetime.utcnow()
+    leaf_cn, ca_cn = "leaf.example.com", "ISRG Root X1"
+
+    def _self(cn):
+        k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+        cert = (x509.CertificateBuilder()
+                .subject_name(subj).issuer_name(subj)
+                .public_key(k.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now).not_valid_after(now + datetime.timedelta(days=1))
+                .sign(k, hashes.SHA256()))
+        pem = cert.public_bytes(serialization.Encoding.PEM).decode()
+        kpem = k.private_bytes(serialization.Encoding.PEM,
+                              serialization.PrivateFormat.TraditionalOpenSSL,
+                              serialization.NoEncryption()).decode()
+        return pem, kpem
+
+    leaf_pem, leaf_key = _self(leaf_cn)
+    ca_pem, _ = _self(ca_cn)
+    fullchain = leaf_pem + ca_pem
+    return fullchain, leaf_key, leaf_cn, ca_cn, ca_pem
+
+
+def test_split_pem_certs_splits_bundle():
+    from src.queries import _split_pem_certs
+    a = "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n"
+    b = "-----BEGIN CERTIFICATE-----\nBBB\n-----END CERTIFICATE-----\n"
+    blocks = _split_pem_certs(a + b)
+    assert len(blocks) == 2
+    assert "BEGIN CERTIFICATE" in blocks[0] and "END CERTIFICATE" in blocks[0]
+    assert blocks[0] != blocks[1]
+
+
+def test_ca_certs_to_trust_prefers_chain():
+    """Explicit chain (CA chain, no leaf) → all its certs are returned."""
+    from src.queries import _ca_certs_to_trust
+    leaf = "-----BEGIN CERTIFICATE-----\nLEAF\n-----END CERTIFICATE-----\n"
+    ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n"
+    cas = _ca_certs_to_trust(leaf + ca, ca)
+    assert len(cas) == 1
+    assert "CA" in cas[0] and "LEAF" not in cas[0]
+
+
+def test_ca_certs_to_trust_skips_leaf_from_fullchain():
+    """No explicit chain → derive from fullchain by skipping the first (leaf)."""
+    from src.queries import _ca_certs_to_trust
+    leaf = "-----BEGIN CERTIFICATE-----\nLEAF\n-----END CERTIFICATE-----\n"
+    ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n"
+    cas = _ca_certs_to_trust(leaf + ca, "")
+    assert len(cas) == 1
+    assert "CA" in cas[0]
+
+
+def test_cert_subject_cn_extracts_cn():
+    from src.queries import _cert_subject_cn
+    fullchain, _key, leaf_cn, ca_cn, ca_pem = _real_chain()
+    assert _cert_subject_cn(ca_pem) == ca_cn
+
+
+def _ctl_queries(mock_client, ctl_items=None):
+    """CPPMQueries with query.side_effect keyed by URL: cluster/server → one
+    server, cert-trust-list → ctl_items (default empty). _request default
+    SUCCESS. Tests override _request.side_effect/return_value as needed."""
+    def _query(path, *a, **k):
+        if "cert-trust-list" in path:
+            return {"_embedded": {"items": ctl_items or []},
+                    "count": len(ctl_items or [])}
+        return [{"server_uuid": "srv-uuid", "name": "cppm-node"}]
+    mock_client.query.side_effect = _query
+    mock_client._request.return_value = {"status": "SUCCESS", "id": "1"}
+    return CPPMQueries(mock_client)
+
+
+def test_ensure_trust_list_posts_new_ca(monkeypatch):
+    monkeypatch.setenv("LM_CPPM_P12_HOST", "127.0.0.1")
+    mock_client = MagicMock(spec=CPPMClient)
+    q = _ctl_queries(mock_client, ctl_items=[])  # empty CTL → POST the CA
+    fullchain, _key, leaf_cn, ca_cn, _ = _real_chain()
+
+    results = q._ensure_trust_list_cas(fullchain, "")
+
+    assert len(results) == 1
+    assert results[0]["ca"] == ca_cn
+    assert results[0]["action"] == "added"
+    # POST went to /api/cert-trust-list with cert_file + cert_usage + enabled.
+    post_calls = [c for c in mock_client._request.call_args_list
+                  if c.args[0] == "POST" and c.args[1] == "/api/cert-trust-list"]
+    assert len(post_calls) == 1
+    body = post_calls[0].kwargs["json"]
+    assert "BEGIN CERTIFICATE" in body["cert_file"]
+    assert body["cert_usage"] == ["Others"]
+    assert body["enabled"] is True
+
+
+def test_ensure_trust_list_skips_and_enables_existing(monkeypatch):
+    """A CA already in the CTL (matched by subject CN) is PATCH-enabled, not
+    re-POSTed — idempotent across cert renewals (the root CA is stable)."""
+    monkeypatch.setenv("LM_CPPM_P12_HOST", "127.0.0.1")
+    mock_client = MagicMock(spec=CPPMClient)
+    fullchain, _key, leaf_cn, ca_cn, _ = _real_chain()
+    ctl_items = [{"id": 42, "subject_common_name": ca_cn, "enabled": False}]
+    q = _ctl_queries(mock_client, ctl_items=ctl_items)
+
+    results = q._ensure_trust_list_cas(fullchain, "")
+
+    assert results[0]["action"] == "already-trusted"
+    assert results[0]["enabled"] is True
+    patch_calls = [c for c in mock_client._request.call_args_list
+                  if c.args[0] == "PATCH"]
+    assert len(patch_calls) == 1
+    assert patch_calls[0].args[1] == "/api/cert-trust-list/42"
+    assert patch_calls[0].kwargs["json"] == {"enabled": True}
+    # No POST of a duplicate.
+    assert not any(c.args[0] == "POST" for c in mock_client._request.call_args_list)
+
+
+def test_ensure_trust_list_duplicate_conflict_is_fine(monkeypatch):
+    """A POST that returns 'already exists' (CA present under a usage we didn't
+    match on GET) is treated as already-trusted, not an error."""
+    monkeypatch.setenv("LM_CPPM_P12_HOST", "127.0.0.1")
+    mock_client = MagicMock(spec=CPPMClient)
+    q = _ctl_queries(mock_client, ctl_items=[])
+    fullchain, _key, leaf_cn, ca_cn, _ = _real_chain()
+    mock_client._request.side_effect = [
+        {"status": "ERROR", "message": "Certificate already exists in trust list"},
+    ]
+
+    results = q._ensure_trust_list_cas(fullchain, "")
+
+    assert results[0]["action"] == "already-trusted"
+
+
+def test_ensure_trust_list_blind_post_when_get_fails(monkeypatch):
+    """If the GET list fails (unknown shape / API error), the step degrades to a
+    blind POST — no idempotency index, but the CA still gets added."""
+    monkeypatch.setenv("LM_CPPM_P12_HOST", "127.0.0.1")
+    mock_client = MagicMock(spec=CPPMClient)
+    mock_client.query.side_effect = RuntimeError("api timeout")
+    mock_client._request.return_value = {"status": "SUCCESS", "id": "7"}
+    q = CPPMQueries(mock_client)
+    fullchain, _key, leaf_cn, ca_cn, _ = _real_chain()
+
+    results = q._ensure_trust_list_cas(fullchain, "")
+
+    assert results[0]["action"] == "added"
+    assert any(c.args[0] == "POST" for c in mock_client._request.call_args_list)
+
+
+def test_import_cert_runs_ctl_before_put_and_returns_trust_list(monkeypatch):
+    """End-to-end: import_cert adds the CA to the CTL BEFORE the server-cert PUT
+    and surfaces the CTL results in the SUCCESS envelope."""
+    monkeypatch.setenv("LM_CPPM_P12_HOST", "127.0.0.1")
+    mock_client = MagicMock(spec=CPPMClient)
+    fullchain, leaf_key, leaf_cn, ca_cn, _ = _real_chain()
+    q = _ctl_queries(mock_client, ctl_items=[])  # CA not yet trusted
+    q._build_pkcs12 = lambda f, k, p: b"P12"
+
+    res = q.import_cert(fullchain=fullchain, privkey=leaf_key, domain="a.example.com")
+
+    assert res["status"] == "SUCCESS"
+    assert "trust_list" in res
+    assert res["trust_list"] and res["trust_list"][0]["ca"] == ca_cn
+    # Ordering: the CTL POST precedes the server-cert PUT.
+    calls = mock_client._request.call_args_list
+    methods = [(c.args[0], c.args[1]) for c in calls]
+    ctl_post_idx = next(i for i, c in enumerate(methods) if c == ("POST", "/api/cert-trust-list"))
+    put_idx = next(i for i, c in enumerate(methods) if c[0] == "PUT")
+    assert ctl_post_idx < put_idx
+
+
+def test_import_cert_ctl_failure_does_not_block_put(monkeypatch):
+    """A CTL POST failure is logged + surfaced, but the server-cert PUT still
+    runs (non-blocking) — never a new blocker; the PUT gives the real diagnostic."""
+    monkeypatch.setenv("LM_CPPM_P12_HOST", "127.0.0.1")
+    mock_client = MagicMock(spec=CPPMClient)
+    fullchain, leaf_key, leaf_cn, ca_cn, _ = _real_chain()
+    # CTL GET ok (empty), CTL POST raises, server-cert PUT returns a 422.
+    mock_client.query.side_effect = lambda path, *a, **k: (
+        {"_embedded": {"items": []}} if "cert-trust-list" in path
+        else [{"server_uuid": "srv-uuid"}])
+    mock_client._request.side_effect = [
+        RuntimeError("ctl post boom"),
+        {"status": "ERROR", "message": "Certificate CA ... must be added"},
+    ]
+    q = CPPMQueries(mock_client)
+    q._build_pkcs12 = lambda f, k, p: b"P12"
+
+    res = q.import_cert(fullchain=fullchain, privkey=leaf_key, domain="a.example.com")
+
+    # PUT still ran → the real 422 surfaces (not swallowed by the CTL failure).
+    assert res["status"] == "ERROR"
+    assert "must be added" in res["message"]
+    # CTL failure recorded in the envelope.
+    assert res["trust_list"] and res["trust_list"][0]["action"] == "error"
+    # Both REST calls happened (CTL POST then PUT).
+    assert mock_client._request.call_count == 2
