@@ -126,17 +126,116 @@ def _split_pem_certs(pem_text: str) -> list:
     return blocks
 
 
+# Canonical Let's Encrypt root CAs (self-signed, stable, publicly anchored).
+# certbot's ``chain.pem`` / ``fullchain.pem`` ship ONLY the leaf + intermediate(s)
+# — NEVER the self-signed root — so a chain that stops at an R3/R10/R11 (→ ISRG
+# Root X1) or E5/E6 (→ ISRG Root X2) intermediate is missing the very cert
+# ClearPass demands in its Certificate Trust List. These are appended by
+# ``_ca_certs_to_trust`` when the supplied chain isn't already rooted.
+_ISRG_ROOT_X1_PEM = """-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+"""
+
+_ISRG_ROOT_X2_PEM = """-----BEGIN CERTIFICATE-----
+MIICGzCCAaGgAwIBAgIQQdKd0XLq7qeAwSxs6S+HUjAKBggqhkjOPQQDAzBPMQsw
+CQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2gg
+R3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMjAeFw0yMDA5MDQwMDAwMDBaFw00
+MDA5MTcxNjAwMDBaME8xCzAJBgNVBAYTAlVTMSkwJwYDVQQKEyBJbnRlcm5ldCBT
+ZWN1cml0eSBSZXNlYXJjaCBHcm91cDEVMBMGA1UEAxMMSVNSRyBSb290IFgyMHYw
+EAYHKoZIzj0CAQYFK4EEACIDYgAEzZvVn4CDCuwJSvMWSj5cz3es3mcFDR0HttwW
++1qLFNvicWDEukWVEYmO6gbf9yoWHKS5xcUy4APgHoIYOIvXRdgKam7mAHf7AlF9
+ItgKbppbd9/w+kHsOdx1ymgHDB/qo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T
+AQH/BAUwAwEB/zAdBgNVHQ4EFgQUfEKWrt5LSDv6kviejM9ti6lyN5UwCgYIKoZI
+zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW
+tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1
+/q4AaOeMSQ+2b1tbFfLn
+-----END CERTIFICATE-----
+"""
+
+# Missing-root Subject CN → canonical ISRG root PEM. The topmost cert in a
+# certbot chain is an intermediate (issuer = the root); we map that issuer CN
+# to the root PEM to append.
+_LE_ROOT_BY_CN = {
+    "ISRG Root X1": _ISRG_ROOT_X1_PEM,
+    "ISRG Root X2": _ISRG_ROOT_X2_PEM,
+}
+
+
+def _missing_root_pem(ca_pems: list) -> Optional[str]:
+    """Return the canonical ISRG root PEM to append when the supplied CA chain
+    stops at a non-self-signed intermediate, else ``None``.
+
+    certbot's ``chain.pem``/``fullchain.pem`` never include the self-signed
+    root, so a chain ending at R3/R10/R11 (issuer ``ISRG Root X1``) or E5/E6
+    (issuer ``ISRG Root X2``) is missing the root ClearPass requires in the
+    CTL. We detect by inspecting the LAST cert: if it's self-signed
+    (issuer == subject) the root is already present; otherwise the issuer CN
+    names the missing root. Best-effort — a non-LE issuer (or a parse failure)
+    returns ``None`` and the chain is left as-is (today's behavior)."""
+    if not ca_pems:
+        return None
+    try:
+        from cryptography import x509
+        last = x509.load_pem_x509_certificate(ca_pems[-1].encode())
+    except Exception:
+        return None
+    if last.issuer == last.subject:          # self-signed → root already present
+        return None
+    cn_attrs = last.issuer.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+    cn = str(cn_attrs[0].value).strip() if cn_attrs else ""
+    return _LE_ROOT_BY_CN.get(cn)
+
+
 def _ca_certs_to_trust(fullchain: str, chain: str) -> list:
     """Return the CA certs (intermediates + root) to add to ClearPass's
     Certificate Trust List, as PEM strings. Prefers the explicit ``chain``
     (CA chain, no leaf); otherwise derives from ``fullchain`` by skipping the
     first cert (the leaf). ClearPass 422's a third-party-CA-signed server
     cert until the issuing root CA is imported AND enabled in the CTL —
-    these are the CAs the leaf chains up to."""
+    these are the CAs the leaf chains up to.
+
+    certbot ships ONLY the leaf + intermediate(s) (never the self-signed
+    root), so when the derived chain stops at a non-self-signed intermediate
+    we append the canonical ISRG root its issuer names (``_missing_root_pem``)
+    — that root is the cert ClearPass's 422 names."""
     if chain and "BEGIN CERTIFICATE" in chain:
-        return _split_pem_certs(chain)
-    blocks = _split_pem_certs(fullchain)
-    return blocks[1:] if len(blocks) > 1 else []
+        cas = _split_pem_certs(chain)
+    else:
+        blocks = _split_pem_certs(fullchain)
+        cas = blocks[1:] if len(blocks) > 1 else []
+    root = _missing_root_pem(cas)
+    if root and root not in cas:
+        cas.append(root)
+    return cas
 
 
 def _cert_subject_cn(pem: str) -> str:

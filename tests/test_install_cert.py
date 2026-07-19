@@ -362,6 +362,114 @@ def test_cert_subject_cn_extracts_cn():
     assert _cert_subject_cn(ca_pem) == ca_cn
 
 
+def _le_chain(root_cn="ISRG Root X1"):
+    """A certbot-shaped chain: leaf → single intermediate whose ISSUER CN names an
+    ISRG root, root OMITTED (exactly certbot's chain.pem/fullchain.pem — leaf +
+    intermediate only, never the self-signed root). The intermediate is built
+    subject=R3 / issuer=<root_cn> so it is NOT self-signed by name, which is the
+    signal ``_missing_root_pem`` keys on. Returns
+    (fullchain_pem, chain_pem, intermediate_pem, root_cn, leaf_privkey)."""
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+        import datetime
+    except Exception:
+        pytest.skip("cryptography not installed")
+    now = datetime.datetime.utcnow()
+
+    def _cert(subj_cn, iss_cn, key):
+        subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, subj_cn)])
+        iss = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, iss_cn)])
+        return (x509.CertificateBuilder()
+                .subject_name(subj).issuer_name(iss)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now).not_valid_after(now + datetime.timedelta(days=1))
+                .sign(key, hashes.SHA256())
+                .public_bytes(serialization.Encoding.PEM).decode())
+
+    leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    int_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    leaf_pem = _cert("leaf.example.com", "R3", leaf_key)
+    int_pem = _cert("R3", root_cn, int_key)        # issuer names the root, not self-signed
+    return leaf_pem + int_pem, int_pem, int_pem, root_cn, leaf_key
+
+
+def test_missing_root_pem_none_when_self_signed():
+    """A chain that already ends in a self-signed root (issuer == subject) → no
+    root to append."""
+    from src.queries import _missing_root_pem
+    _fullchain, _key, _leaf, _ca_cn, ca_pem = _real_chain()   # ca is self-signed
+    assert _missing_root_pem([ca_pem]) is None
+
+
+def test_missing_root_pem_none_for_unknown_issuer():
+    """A non-self-signed intermediate whose issuer isn't a known ISRG root →
+    best-effort None (non-LE chains are left as-is, today's behavior)."""
+    from src.queries import _missing_root_pem
+    _fullchain, chain, _int, _rcn, _key = _le_chain("Some Other Root CA")
+    assert _missing_root_pem([chain]) is None
+
+
+def test_missing_root_pem_appends_isrg_root_x1():
+    """An R3 intermediate (issuer ISRG Root X1) → the canonical ISRG Root X1 PEM
+    is the missing root."""
+    from src.queries import _missing_root_pem, _ISRG_ROOT_X1_PEM
+    _fullchain, chain, _int, _rcn, _key = _le_chain("ISRG Root X1")
+    assert _missing_root_pem([chain]) == _ISRG_ROOT_X1_PEM
+
+
+def test_ca_certs_to_trust_appends_isrg_root_x1():
+    """A certbot-shaped chain (intermediate only) → _ca_certs_to_trust appends
+    the ISRG Root X1 root so it reaches the CTL alongside the intermediate."""
+    from src.queries import _ca_certs_to_trust, _ISRG_ROOT_X1_PEM
+    fullchain, chain, _int, _rcn, _key = _le_chain("ISRG Root X1")
+    cas = _ca_certs_to_trust(fullchain, chain)
+    assert _ISRG_ROOT_X1_PEM in cas          # root appended
+    assert any("R3" in c for c in cas)      # intermediate still present
+
+
+def test_ca_certs_to_trust_appends_isrg_root_x2_for_ecdsa_intermediate():
+    """An E5/E6-style intermediate (issuer ISRG Root X2) → the X2 root is
+    appended (covers ECDSA server certs)."""
+    from src.queries import _ca_certs_to_trust, _ISRG_ROOT_X2_PEM
+    fullchain, chain, _int, _rcn, _key = _le_chain("ISRG Root X2")
+    cas = _ca_certs_to_trust(fullchain, chain)
+    assert _ISRG_ROOT_X2_PEM in cas
+
+
+def test_ca_certs_to_trust_no_append_when_root_present():
+    """A chain that already includes a self-signed root is NOT doubled."""
+    from src.queries import _ca_certs_to_trust, _ISRG_ROOT_X1_PEM
+    fullchain, _key, _leaf, ca_cn, ca_pem = _real_chain()   # ca self-signed = root
+    cas = _ca_certs_to_trust(fullchain, "")
+    assert len(cas) == 1
+    assert _ISRG_ROOT_X1_PEM not in cas      # not appended (root already in chain)
+
+
+def test_ensure_trust_list_posts_isrg_root_for_certbot_chain(monkeypatch):
+    """The live bug: certbot ships leaf+intermediate only, so ClearPass 422's the
+    server-cert PUT demanding the ISRG root in the CTL. _ensure_trust_list_cas
+    must POST BOTH the intermediate AND the appended root (the root is what
+    ClearPass was missing)."""
+    from src.queries import _cert_subject_cn
+    monkeypatch.setenv("LM_CPPM_P12_HOST", "127.0.0.1")
+    mock_client = MagicMock(spec=CPPMClient)
+    q = _ctl_queries(mock_client, ctl_items=[])           # empty CTL → POST both
+    fullchain, chain, _int, root_cn, _key = _le_chain("ISRG Root X1")
+
+    results = q._ensure_trust_list_cas(fullchain, chain)
+
+    posted_cns = [_cert_subject_cn(c.kwargs["json"]["cert_file"])
+                  for c in mock_client._request.call_args_list
+                  if c.args[0] == "POST" and c.args[1] == "/api/cert-trust-list"]
+    assert "R3" in posted_cns                # intermediate POSTed
+    assert root_cn in posted_cns            # ISRG Root X1 POSTed (the fix)
+    assert [r["ca"] for r in results] == ["R3", root_cn]
+
+
 def _ctl_queries(mock_client, ctl_items=None):
     """CPPMQueries with query.side_effect keyed by URL: cluster/server → one
     server, cert-trust-list → ctl_items (default empty). _request default
