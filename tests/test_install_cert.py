@@ -51,10 +51,38 @@ def _real_pair():
 def _queries_with_cluster(mock_client, uuid="srv-uuid"):
     """A CPPMQueries whose client.query (→ /api/cluster/server) returns one
     server with the given uuid, and whose _request (the PUT) returns SUCCESS
-    by default. Tests override _request.return_value / side_effect as needed."""
-    mock_client.query.return_value = [{"uuid": uuid, "name": "cppm-node"}]
+    by default. Tests override _request.return_value / side_effect as needed.
+
+    The cluster/server item uses ``server_uuid`` (ClearPass's real field); the
+    legacy ``uuid``/``id`` keys are NOT present on the wire."""
+    mock_client.query.return_value = [{"server_uuid": uuid, "name": "cppm-node"}]
     mock_client._request.return_value = {"status": "SUCCESS", "id": "1"}
     return CPPMQueries(mock_client)
+
+
+def test_cluster_server_uuid_prefers_publisher(monkeypatch):
+    """_cluster_server_uuid returns the publisher's server_uuid when the
+    publisher is not the first item (cert should land on the publisher so it
+    replicates across the cluster)."""
+    monkeypatch.delenv("LM_CPPM_P12_HOST", raising=False)
+    mock_client = MagicMock(spec=CPPMClient)
+    mock_client.query.return_value = [
+        {"server_uuid": "subscriber-uuid", "name": "sub", "is_publisher": False},
+        {"server_uuid": "publisher-uuid", "name": "pub", "is_publisher": True},
+    ]
+    q = CPPMQueries(mock_client)
+    assert q._cluster_server_uuid() == "publisher-uuid"
+
+
+def test_cluster_server_uuid_legacy_is_master(monkeypatch):
+    """Pre-6.11 ClearPass uses ``is_master`` instead of ``is_publisher``."""
+    monkeypatch.delenv("LM_CPPM_P12_HOST", raising=False)
+    mock_client = MagicMock(spec=CPPMClient)
+    mock_client.query.return_value = [
+        {"server_uuid": "leg-uuid", "name": "old", "is_master": True},
+    ]
+    q = CPPMQueries(mock_client)
+    assert q._cluster_server_uuid() == "leg-uuid"
 
 
 def test_import_cert_success_builds_p12_url_and_puts(monkeypatch):

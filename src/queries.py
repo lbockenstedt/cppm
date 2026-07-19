@@ -1290,16 +1290,28 @@ class CPPMQueries:
 
     def _cluster_server_uuid(self) -> str:
         """Discover the ClearPass cluster server UUID via
-        ``GET /api/cluster/server``. Returns the first server's ``uuid``
-        (falling back to ``id``). Raises ``RuntimeError`` with the API detail
-        on failure so import_cert can surface a precise ERROR."""
+        ``GET /api/cluster/server``. ClearPass items use ``server_uuid``
+        (NOT ``uuid``/``id`` — those keys don't exist, which surfaced as
+        "cluster server has no uuid/id"). Prefer the publisher
+        (``is_publisher``, or ``is_master`` on pre-6.11 builds) so the cert
+        lands on the cluster publisher and replicates; fall back to the first
+        server. Raises ``RuntimeError`` with the API detail on failure."""
         srv = self.client.query("/api/cluster/server")
         if isinstance(srv, dict) and srv.get("status") == "ERROR":
             raise RuntimeError(f"GET /api/cluster/server failed: {srv.get('message')}")
         items = self._items(srv)
         if not items:
             raise RuntimeError("no cluster servers returned by /api/cluster/server")
-        return items[0].get("uuid") or items[0].get("id") or ""
+
+        def _uuid_of(it: Dict[str, Any]) -> str:
+            return (it.get("server_uuid") or it.get("uuid")
+                    or it.get("id") or "")
+        for it in items:
+            if it.get("is_publisher") or it.get("is_master"):
+                uid = _uuid_of(it)
+                if uid:
+                    return uid
+        return _uuid_of(items[0])
 
     def import_cert(self, fullchain: str, privkey: str, domain: str = "",
                     service_name: str = "HTTPS(RSA)",
