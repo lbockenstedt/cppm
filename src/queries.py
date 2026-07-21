@@ -1,6 +1,5 @@
 from typing import Any, Dict, List, Optional
 from client import CPPMClient
-import concurrent.futures
 import datetime as _dt
 import json
 import logging
@@ -9,6 +8,13 @@ import re
 logger = logging.getLogger("CPPMQueries")
 
 class ResourceNotFound(Exception):
+    pass
+
+
+class ReplaceScanAborted(Exception):
+    """Raised by ``_remove_absent_tagged`` when the replace-scan refuses to
+    delete — an empty batch, or a removal set exceeding the safety ratio — so
+    the caller surfaces it as a sync ERROR instead of mass-deleting endpoints."""
     pass
 
 
@@ -482,24 +488,21 @@ class CPPMQueries:
         ``acctstoptime``); without this filter ClearPass returns every session
         ever recorded and the count grows monotonically."""
         active_filter = json.dumps({"acctstoptime": {"$exists": False}}, separators=(",", ":"))
-        # Four independent count queries were issued serially (4 sequential
-        # HTTP RTTs). requests.Session is sync, so run them in a 4-thread pool
-        # to overlap the RTTs; the shared client.session is safe for concurrent
-        # reads (requests.Session is not guaranteed thread-safe for writes,
-        # but these are plain GETs with no header mutation between them).
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            fut_sessions = pool.submit(self.client.query, "/api/session",
-                                       params={"calculate_count": "true", "limit": 1, "filter": active_filter})
-            fut_devices = pool.submit(self.client.query, "/api/endpoint",
-                                      params={"calculate_count": "true", "limit": 1})
-            fut_known = pool.submit(self.client.query, "/api/endpoint",
-                                    params={"calculate_count": "true", "limit": 1, "filter": '{"status":"Known"}'})
-            fut_unknown = pool.submit(self.client.query, "/api/endpoint",
-                                      params={"calculate_count": "true", "limit": 1, "filter": '{"status":"Unknown"}'})
-            sessions_result = fut_sessions.result()
-            devices_result = fut_devices.result()
-            known_result = fut_known.result()
-            unknown_result = fut_unknown.result()
+        # Four independent count queries, run SERIALLY. They share one
+        # requests.Session whose token refresh (client._get_token) mutates
+        # client state (_token / _token_expiry / session.auth); fanning them
+        # across a thread pool raced that refresh — two threads could hit an
+        # expired token at once and stampede /api/oauth, or read _token
+        # mid-write. These are cheap limit=1 count GETs, so sequential latency
+        # is negligible and correctness wins.
+        sessions_result = self.client.query("/api/session",
+            params={"calculate_count": "true", "limit": 1, "filter": active_filter})
+        devices_result = self.client.query("/api/endpoint",
+            params={"calculate_count": "true", "limit": 1})
+        known_result = self.client.query("/api/endpoint",
+            params={"calculate_count": "true", "limit": 1, "filter": '{"status":"Known"}'})
+        unknown_result = self.client.query("/api/endpoint",
+            params={"calculate_count": "true", "limit": 1, "filter": '{"status":"Unknown"}'})
         return {
             "status": "SUCCESS",
             "active_sessions": sessions_result.get("count", 0) if isinstance(sessions_result, dict) else 0,
@@ -880,8 +883,30 @@ class CPPMQueries:
         attribute (ClearPass's filter support for arbitrary attributes is
         inconsistent across versions, so a client-side scan is the reliable
         path). Returns the number deleted.
+
+        SAFETY: this DELETEs every tenant-tagged endpoint whose key is absent
+        from ``batch_keys``. An empty/truncated/failed batch would therefore
+        wipe the tenant's entire ClearPass inventory. Two guards prevent that:
+          1. An empty ``batch_keys`` aborts outright (nothing to reconcile
+             against — every tagged endpoint would look "absent").
+          2. A two-pass scan tallies the total tagged set first; if the
+             removal set would exceed 50% of it, the scan aborts without
+             deleting. Both raise ``ReplaceScanAborted`` so the sync surfaces
+             an ERROR rather than silently mass-deleting.
         """
-        removed = 0
+        # Guard 1: an empty batch means the upstream produced no endpoints
+        # (empty/truncated/failed). Reconciling against nothing would delete
+        # the whole tagged inventory — refuse.
+        if not batch_keys:
+            raise ReplaceScanAborted(
+                f"empty batch for tenant '{tenant_slug}' — refusing to remove "
+                "any tagged endpoints (would delete the entire tenant inventory)")
+
+        # Pass 1: enumerate this tenant's tagged endpoints and which are absent
+        # from the batch, tallying the total so a runaway removal can be caught
+        # BEFORE any DELETE is issued.
+        tagged_total = 0
+        to_delete: List[str] = []  # endpoint ids
         limit = 1000
         offset = 0
         while True:
@@ -897,6 +922,7 @@ class CPPMQueries:
                 attrs = ep.get("attributes") or {}
                 if attrs.get(self.TENANT_ATTR_SLUG) != tenant_slug:
                     continue
+                tagged_total += 1
                 mac = self._norm_mac(ep.get("mac_address", ""))
                 ip_val = attrs.get("IP Address") or attrs.get("ip_address") or ep.get("ip_address") or ""
                 ip = ip_val.strip() if isinstance(ip_val, str) else ""
@@ -906,16 +932,29 @@ class CPPMQueries:
                 ep_id = ep.get("id")
                 if not ep_id:
                     continue
-                d = self.client._request("DELETE", f"/api/endpoint/{ep_id}")
-                if isinstance(d, dict) and d.get("status") != "ERROR":
-                    removed += 1
-                else:
-                    logger.warning("endpoint DELETE %s failed: %s", ep_id,
-                                   d.get("message") if isinstance(d, dict) else d)
+                to_delete.append(ep_id)
             count = res.get("count", 0) if isinstance(res, dict) else 0
             offset += limit
             if len(items) < limit or offset >= count:
                 break
+
+        # Guard 2: refuse a removal that would take out more than half of the
+        # tenant's currently-tagged endpoints — the signature of a truncated or
+        # partially-failed batch. Surface it loudly instead of deleting.
+        if tagged_total and len(to_delete) > tagged_total * 0.5:
+            raise ReplaceScanAborted(
+                f"replace-scan for tenant '{tenant_slug}' would remove "
+                f"{len(to_delete)} of {tagged_total} tagged endpoints (>50%) — "
+                "likely a truncated/failed batch; refusing to mass-delete")
+
+        removed = 0
+        for ep_id in to_delete:
+            d = self.client._request("DELETE", f"/api/endpoint/{ep_id}")
+            if isinstance(d, dict) and d.get("status") != "ERROR":
+                removed += 1
+            else:
+                logger.warning("endpoint DELETE %s failed: %s", ep_id,
+                               d.get("message") if isinstance(d, dict) else d)
         return removed
 
     def sync_endpoints(self, tenant_id: str, tenant_slug: str, tenant_name: str,
@@ -1070,6 +1109,14 @@ class CPPMQueries:
         if replace:
             try:
                 removed = self._remove_absent_tagged(tenant_slug, batch_keys)
+            except ReplaceScanAborted as e:
+                # Deliberate safety abort (empty/runaway batch) — count it as an
+                # error so the sync reports ERROR rather than a silent success
+                # that skipped stale-removal. Nothing was deleted.
+                errors += 1
+                err_msgs.append(f"replace-scan aborted: {e}")
+                logger.error("endpoint sync tenant=%s replace-scan aborted: %s",
+                             tenant_slug, e)
             except Exception as e:
                 err_msgs.append(f"replace-scan: {e}")
 
