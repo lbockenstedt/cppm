@@ -241,7 +241,11 @@ class CPPMSpoke:
 
         if normalized == "SEARCH_SESSIONS":
             return await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.queries.search(data.get("q", ""))
+                None, lambda: self.queries.search(
+                    data.get("q", ""),
+                    tenant=data.get("tenant", ""),
+                    is_admin=bool(data.get("is_admin", False)),
+                )
             )
 
         if normalized == "CPPM_SYNC_ENDPOINTS":

@@ -1240,6 +1240,9 @@ class CPPMQueries:
         # Prefer the Hostname attribute (populated by sync / profiler) for the
         # display name; fall back to MAC so the row is never blank.
         name = attrs.get("Hostname") or ep.get("mac_address", "")
+        # Tenant slug stamped by the IPAM→CPPM sync (or the at-auth-time CSA).
+        # Empty when the endpoint has no NetBox tenant tag (e.g. profiler-only).
+        tenant_slug = (attrs.get(self.TENANT_ATTR_SLUG) or "").strip()
         return {
             "source":  "cppm",
             "type":    "endpoint",
@@ -1248,6 +1251,7 @@ class CPPMQueries:
             "mac":     ep.get("mac_address", ""),
             "status":  ep.get("status", ""),
             "vendor":  ep.get("vendor_name", ""),
+            "tenant":  tenant_slug,
             "id":      ep.get("id", ""),
         }
 
@@ -1282,7 +1286,8 @@ class CPPMQueries:
                 return True
         return False
 
-    def search(self, query: str) -> Dict[str, Any]:
+    def search(self, query: str, tenant: str = "",
+               is_admin: bool = False) -> Dict[str, Any]:
         """
         Search CPPM endpoints (Device Inventory) and active sessions by
         substring across MAC / IP / hostname / vendor / username / NAS.
@@ -1292,22 +1297,57 @@ class CPPMQueries:
         (precise + cheap), then a bounded paged scan of the endpoint inventory
         and the active-session list matches `q` as a case-insensitive substring
         of any text field. Returns normalised results tagged source="cppm".
+
+        Tenant scoping (enforced spoke-side per the hub payload contract):
+          - `tenant` slug set → only emit results whose NetBox_Tenant_Slug
+            matches. Sessions don't carry a tenant attribute directly, so each
+            session is joined to its endpoint by MAC to resolve the slug; a
+            session whose MAC has no endpoint (or a non-matching one) is
+            dropped.
+          - `tenant` absent + `is_admin` True → unscoped (all results).
+          - `tenant` absent + `is_admin` False → empty (never leak another
+            tenant's sessions/endpoints).
+
+        Each sub-search (endpoints, sessions) is wrapped in its own try/except
+        so a failure in one doesn't drop the other.
         """
         q = query.strip().lower()
         if not q:
             return {"status": "SUCCESS", "results": [], "count": 0}
+
+        scoped = bool(tenant)
+        if not scoped and not is_admin:
+            # No scope + non-admin → return nothing rather than risk leaking
+            # another tenant's sessions/endpoints.
+            return {"status": "SUCCESS", "results": [], "count": 0}
+
         results = []
         seen_ids: set = set()
+        # MAC → NetBox_Tenant_Slug map, populated from the endpoint scan so
+        # sessions can be joined to a tenant (sessions carry no tenant attr).
+        mac_to_tenant: Dict[str, str] = {}
+
+        def _ep_tenant_slug(ep: Dict[str, Any]) -> str:
+            attrs = ep.get("attributes") or {}
+            return (attrs.get(self.TENANT_ATTR_SLUG) or "").strip()
+
+        # --- Endpoints (exact + bounded substring scan) ---------------------
         try:
-            # --- Exact endpoint lookup (MAC / IP) — precise & cheap ----------
+            # Exact endpoint lookup (MAC / IP) — precise & cheap.
             for filter_def in [{"mac_address": q}, {"ip_address": q}]:
                 ep_r = self.client.query("/api/endpoint", params={"filter": json.dumps(filter_def, separators=(",", ":")), "limit": 10})
                 for ep in self._items(ep_r):
+                    mac = self._norm_mac(ep.get("mac_address", ""))
+                    tslug = _ep_tenant_slug(ep)
+                    if mac:
+                        mac_to_tenant[mac] = tslug
+                    if scoped and tslug != tenant:
+                        continue
                     if ep.get("id") and ep["id"] not in seen_ids:
                         seen_ids.add(ep["id"])
                         results.append(self._endpoint_search_result(ep))
 
-            # --- Endpoint substring scan (bounded) --------------------------
+            # Endpoint substring scan (bounded).
             limit = 1000
             offset = 0
             scanned = 0
@@ -1321,7 +1361,13 @@ class CPPMQueries:
                 if not items:
                     break
                 for ep in items:
+                    mac = self._norm_mac(ep.get("mac_address", ""))
+                    tslug = _ep_tenant_slug(ep)
+                    if mac:
+                        mac_to_tenant[mac] = tslug
                     if not self._endpoint_matches(ep, q):
+                        continue
+                    if scoped and tslug != tenant:
                         continue
                     if ep.get("id") and ep["id"] in seen_ids:
                         continue
@@ -1333,8 +1379,11 @@ class CPPMQueries:
                 offset += limit
                 if len(items) < limit or offset >= count:
                     break
+        except Exception as e:
+            logger.error(f"CPPM endpoint search failed: {e}")
 
-            # --- Active sessions (bounded) — substring by IP/MAC/user/NAS ---
+        # --- Active sessions (bounded) — substring by IP/MAC/user/NAS ------
+        try:
             limit = 1000
             offset = 0
             while True:
@@ -1365,6 +1414,14 @@ class CPPMQueries:
                             matched = q_hex in mac_hex
                     if not matched:
                         continue
+                    # Resolve the session's tenant by joining to its endpoint
+                    # (sessions carry no tenant attribute of their own).
+                    smac = self._norm_mac(s.get("callingstation", ""))
+                    stenant = mac_to_tenant.get(smac, "")
+                    if scoped and stenant != tenant:
+                        # No endpoint, or endpoint's tenant doesn't match → drop
+                        # for scoped callers (never leak across tenants).
+                        continue
                     results.append({
                         "source":   "cppm",
                         "type":     "session",
@@ -1373,6 +1430,7 @@ class CPPMQueries:
                         "mac":      s.get("callingstation", ""),
                         "nas":      _nas_name(s),
                         "role":     (roles or [""])[0] if isinstance(roles, list) else s.get("role", ""),
+                        "tenant":   stenant,
                         "id":       s.get("id", ""),
                     })
                 count = session_r.get("count", 0) if isinstance(session_r, dict) else 0
@@ -1380,8 +1438,7 @@ class CPPMQueries:
                 if len(items) < limit or offset >= count:
                     break
         except Exception as e:
-            logger.error(f"CPPM search failed: {e}")
-            return {"status": "ERROR", "message": str(e), "results": []}
+            logger.error(f"CPPM session search failed: {e}")
 
         # Deduplicate by id
         seen: set = set()
