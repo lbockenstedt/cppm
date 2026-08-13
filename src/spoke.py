@@ -169,11 +169,11 @@ class CPPMSpoke:
             # Realtime NAC→IPAM reverse sync pull: sessions started in the last
             # ``lookback_minutes`` (default 2). NOT in CACHED — time-sensitive,
             # the hub loop calls this every ~60s. See lm core/src/realtime_ipam_nac_sync.py.
-            return await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.queries.get_recent_sessions(
-                    lookback_minutes=int(data.get("lookback_minutes", 2))
-                )
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self.queries.get_recent_sessions(
+                lookback_minutes=int(data.get("lookback_minutes", 2))
             )
+        )
 
         if normalized == "CPPM_GET_DEVICE_DATABASE":
             return await asyncio.get_event_loop().run_in_executor(
