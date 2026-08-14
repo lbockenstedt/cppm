@@ -64,30 +64,45 @@ class CPPMClient:
         return host.rstrip("/")
 
     def _try_oauth(self, body: dict) -> Optional[str]:
-        """Attempt a single OAuth2 token request; return access_token or None."""
+        """Attempt a single OAuth2 token request; return access_token or None.
+        Retries on transient network errors (connection reset, timeout) with
+        exponential backoff to handle intermittent network instability."""
         grant = body.get("grant_type")
         cid = body.get("client_id", "<none>")
-        try:
-            resp = self.session.post(
-                f"{self._base_url()}/api/oauth",
-                json=body,
-                auth=None,
-                timeout=10,
-            )
-            if not resp.ok:
-                logger.warning(f"OAuth {grant} (client_id={cid}): HTTP {resp.status_code} — {resp.text[:200]}")
+        max_retries = 3
+        base_delay = 1.0
+        for attempt in range(max_retries):
+            try:
+                resp = self.session.post(
+                    f"{self._base_url()}/api/oauth",
+                    json=body,
+                    auth=None,
+                    timeout=10,
+                )
+                if not resp.ok:
+                    logger.warning(f"OAuth {grant} (client_id={cid}): HTTP {resp.status_code} — {resp.text[:200]}")
+                    return None
+                data = resp.json()
+                token = data.get("access_token")
+                if token:
+                    self._token_expiry = time.time() + data.get("expires_in", 3600)
+                    logger.info(f"OAuth token obtained via {grant} (client_id={cid})")
+                else:
+                    logger.warning(f"OAuth {grant} (client_id={cid}): no access_token in response: {data}")
+                return token
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                    requests.exceptions.ChunkedEncodingError) as e:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"OAuth {grant} (client_id={cid}) transient error (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {delay:.1f}s...")
+                    time.sleep(delay)
+                    continue
+                logger.warning(f"OAuth {grant} (client_id={cid}) failed after {max_retries} attempts: {e}")
                 return None
-            data = resp.json()
-            token = data.get("access_token")
-            if token:
-                self._token_expiry = time.time() + data.get("expires_in", 3600)
-                logger.info(f"OAuth token obtained via {grant} (client_id={cid})")
-            else:
-                logger.warning(f"OAuth {grant} (client_id={cid}): no access_token in response: {data}")
-            return token
-        except Exception as e:
-            logger.warning(f"OAuth {grant} (client_id={cid}) exception: {e}")
-            return None
+            except Exception as e:
+                logger.warning(f"OAuth {grant} (client_id={cid}) exception: {e}")
+                return None
+        return None
 
     def _get_token(self) -> Optional[str]:
         if self._token and time.time() < self._token_expiry - 30:
