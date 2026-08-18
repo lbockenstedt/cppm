@@ -17,6 +17,16 @@ def load_dotenv():
 load_dotenv()
 logger = logging.getLogger("CPPMClient")
 
+
+def _env_verify_tls() -> bool:
+    value = os.getenv("LM_CPPM_VERIFY_TLS", "true").strip().lower()
+    if value in {"0", "false", "no", "off"}:
+        logger.warning("CPPM TLS certificate verification disabled via LM_CPPM_VERIFY_TLS=%s. "
+                       "Use only for trusted self-signed lab systems.", value)
+        return False
+    return True
+
+
 class CPPMClient:
     """
     REST client for Aruba ClearPass Policy Manager.
@@ -40,7 +50,7 @@ class CPPMClient:
         self._token_expiry: float = 0.0
 
         self.session = requests.Session()
-        self.session.verify = False
+        self.session.verify = _env_verify_tls()
 
         if not self.host:
             logger.warning("CPPM_HOST not set. Client will be inactive until configured.")
