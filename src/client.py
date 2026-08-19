@@ -39,6 +39,7 @@ class CPPMClient:
         password: Optional[str] = None,
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
+        verify_ssl: Optional[bool] = None,
     ):
         self.host = host or os.getenv("CPPM_HOST", "")
         self.user = user or os.getenv("CPPM_USER", "")
@@ -50,22 +51,28 @@ class CPPMClient:
         self._token_expiry: float = 0.0
 
         self.session = requests.Session()
-        self.session.verify = _env_verify_tls()
+        # Per-device verify_ssl (from the instance config) wins when given;
+        # otherwise fall back to the process-wide LM_CPPM_VERIFY_TLS env var,
+        # same default (secure) either way.
+        self.session.verify = _env_verify_tls() if verify_ssl is None else bool(verify_ssl)
 
         if not self.host:
             logger.warning("CPPM_HOST not set. Client will be inactive until configured.")
 
     def update_config(self, host: str, user: str = "", password: str = "",
-                      client_id: str = "", client_secret: str = ""):
+                      client_id: str = "", client_secret: str = "",
+                      verify_ssl: Optional[bool] = None):
         self.host = host
         self.user = user
         self.password = password
         self.client_id = client_id
         self.client_secret = client_secret
+        if verify_ssl is not None:
+            self.session.verify = bool(verify_ssl)
         self._token = None
         self._token_expiry = 0.0
         self.session.auth = None  # clear any stale basic auth from previous attempts
-        logger.info(f"CPPM client reconfigured for host: {host}")
+        logger.info(f"CPPM client reconfigured for host: {host} (verify_ssl={self.session.verify})")
 
     def _base_url(self) -> str:
         host = self.host.strip()
