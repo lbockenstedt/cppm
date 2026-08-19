@@ -80,3 +80,29 @@ def test_update_config_string_false_disables_verify():
     c = CPPMClient(host="cppm.example.com")  # starts verify=True
     c.update_config(host="172.16.1.16", verify_ssl="false")
     assert c.session.verify is False
+
+
+# ── SSL error surfaces the effective verify state (actionable diagnostic) ────
+def test_ssl_error_when_verifying_says_toggle_did_not_land():
+    import requests
+    from unittest.mock import patch
+    c = CPPMClient(host="172.16.1.16", verify_ssl=True)
+    with patch.object(c.session, "request",
+                      side_effect=requests.exceptions.SSLError("CERTIFICATE_VERIFY_FAILED")), \
+         patch.object(c, "_get_token", return_value=None):
+        r = c._request("GET", "api/session")
+    assert r["status"] == "ERROR"
+    assert r["verify_ssl"] is True
+    assert "still VERIFYING" in r["message"]
+
+
+def test_ssl_error_when_not_verifying_flags_non_cert_problem():
+    import requests
+    from unittest.mock import patch
+    c = CPPMClient(host="172.16.1.16", verify_ssl=False)
+    with patch.object(c.session, "request",
+                      side_effect=requests.exceptions.SSLError("boom")), \
+         patch.object(c, "_get_token", return_value=None):
+        r = c._request("GET", "api/session")
+    assert r["verify_ssl"] is False
+    assert "already OFF" in r["message"]
