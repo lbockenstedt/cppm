@@ -72,6 +72,8 @@ class CPPMClient:
         # otherwise fall back to the process-wide LM_CPPM_VERIFY_TLS env var,
         # same default (secure) either way.
         self.session.verify = _env_verify_tls() if verify_ssl is None else _as_bool(verify_ssl)
+        logger.info("CPPMClient init: host=%r session.verify=%r (verify_ssl arg=%r)",
+                    self.host, self.session.verify, verify_ssl)
 
         if not self.host:
             logger.warning("CPPM_HOST not set. Client will be inactive until configured.")
@@ -202,6 +204,28 @@ class CPPMClient:
             logger.error("HTTP error %s for %s %s: %s", code, method, url, detail or "<no body>")
             msg = str(e) if not detail else f"{e} | body: {detail}"
             return {"status": "ERROR", "message": msg, "code": code}
+        except requests.exceptions.SSLError as e:
+            # A TLS verification failure against a self-signed ClearPass is the
+            # single most common CPPM misconfig. str(e) buries the cause in a
+            # long urllib3 chain, and — critically — it does NOT say whether THIS
+            # client is even verifying. Surface the effective verify state so the
+            # operator can tell instantly whether verify_ssl=false actually
+            # reached the spoke (verify=False here + still SSLError = a different
+            # problem; verify=True = the "allow self-signed" toggle never landed,
+            # so redeploy the hub or set LM_CPPM_VERIFY_TLS=false on the spoke).
+            logger.error("SSL error for %s %s (session.verify=%r): %s",
+                         method, url, self.session.verify, e)
+            hint = (" — this spoke is still VERIFYING TLS (session.verify=True): "
+                    "the instance's 'allow untrusted / self-signed' setting has "
+                    "not reached this spoke. Redeploy/restart the hub so it "
+                    "pushes verify_ssl=false, or set LM_CPPM_VERIFY_TLS=false on "
+                    "the spoke and restart it."
+                    if self.session.verify else
+                    " — TLS verification is already OFF on this spoke, so this is "
+                    "a different transport error (host/port/network), not a cert "
+                    "trust problem.")
+            return {"status": "ERROR", "message": f"{e}{hint}",
+                    "verify_ssl": bool(self.session.verify)}
         except requests.exceptions.RequestException as e:
             logger.error(f"Request failed for {method} {url}: {e}")
             return {"status": "ERROR", "message": str(e)}
