@@ -18,6 +18,23 @@ load_dotenv()
 logger = logging.getLogger("CPPMClient")
 
 
+_FALSEY_STR = {"0", "false", "no", "off", "none", "null", ""}
+
+
+def _as_bool(value: Any) -> bool:
+    """Coerce a config value to bool WITHOUT the ``bool("false") is True`` trap.
+
+    The instance's ``verify_ssl`` reaches us over JSON/config and can arrive as a
+    real bool OR as a string ("false", "0", …) — e.g. hand-edited config, an
+    older UI that stored the select value as text, or a relay that stringified
+    it. Plain ``bool("false")`` is truthy, which would silently re-enable TLS
+    verification on a self-signed ClearPass and fail every call with
+    CERTIFICATE_VERIFY_FAILED. Treat the usual falsey strings as False."""
+    if isinstance(value, str):
+        return value.strip().lower() not in _FALSEY_STR
+    return bool(value)
+
+
 def _env_verify_tls() -> bool:
     value = os.getenv("LM_CPPM_VERIFY_TLS", "true").strip().lower()
     if value in {"0", "false", "no", "off"}:
@@ -54,7 +71,7 @@ class CPPMClient:
         # Per-device verify_ssl (from the instance config) wins when given;
         # otherwise fall back to the process-wide LM_CPPM_VERIFY_TLS env var,
         # same default (secure) either way.
-        self.session.verify = _env_verify_tls() if verify_ssl is None else bool(verify_ssl)
+        self.session.verify = _env_verify_tls() if verify_ssl is None else _as_bool(verify_ssl)
 
         if not self.host:
             logger.warning("CPPM_HOST not set. Client will be inactive until configured.")
@@ -68,7 +85,7 @@ class CPPMClient:
         self.client_id = client_id
         self.client_secret = client_secret
         if verify_ssl is not None:
-            self.session.verify = bool(verify_ssl)
+            self.session.verify = _as_bool(verify_ssl)
         self._token = None
         self._token_expiry = 0.0
         self.session.auth = None  # clear any stale basic auth from previous attempts
