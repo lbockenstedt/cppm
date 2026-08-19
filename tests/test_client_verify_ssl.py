@@ -57,3 +57,26 @@ def test_update_config_without_verify_ssl_leaves_setting_unchanged():
     c = CPPMClient(host="cppm.example.com", verify_ssl=False)
     c.update_config(host="172.16.1.16")  # no verify_ssl kwarg
     assert c.session.verify is False
+
+
+# ── string-valued verify_ssl (the bool("false") is True trap) ────────────────
+# The nac_instances config can reach the client as a STRING ("false"/"0") — an
+# older UI that stored the select as text, a hand-edited config, or a relay that
+# stringified the JSON. Plain bool("false") is truthy, which would silently
+# re-enable verification against a self-signed ClearPass and 502 every call.
+def test_construction_string_false_disables_verify():
+    for falsey in ("false", "False", "0", "no", "off", "none", ""):
+        c = CPPMClient(host="cppm.example.com", verify_ssl=falsey)
+        assert c.session.verify is False, f"{falsey!r} should disable verify"
+
+
+def test_construction_string_true_enables_verify():
+    for truthy in ("true", "True", "1", "yes", "on"):
+        c = CPPMClient(host="cppm.example.com", verify_ssl=truthy)
+        assert c.session.verify is True, f"{truthy!r} should enable verify"
+
+
+def test_update_config_string_false_disables_verify():
+    c = CPPMClient(host="cppm.example.com")  # starts verify=True
+    c.update_config(host="172.16.1.16", verify_ssl="false")
+    assert c.session.verify is False
