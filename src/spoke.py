@@ -92,6 +92,7 @@ class CPPMSpoke:
                 password=data.get("password", ""),
                 client_id=data.get("client_id", ""),
                 client_secret=data.get("client_secret", ""),
+                verify_ssl=data.get("verify_ssl", True),
             )
             return {"status": "SUCCESS", "message": f"Config updated for host {host}"}
 
