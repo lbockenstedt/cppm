@@ -1,3 +1,8 @@
+---
+summary: "Aruba ClearPass Policy Manager spoke. Repo: cppm. moduletype = 'nac'. See architecture-topology.md."
+keywords: [backends, behaviors, client_credentials, client_id, cppm, cppm_get_recent_sessions, cppm_sync_endpoints, lm, netbox, update_config]
+---
+
 # cppm — ClearPass NAC
 
 Aruba ClearPass Policy Manager spoke. Repo: `cppm`. `module_type = "nac"`. See [architecture-topology.md](architecture-topology.md).
