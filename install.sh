@@ -149,10 +149,15 @@ retire_legacy_agent
 
 if [ -d "cppm/.git" ]; then
     echo "📂 CPPM repository already exists. Updating..."
-    cd cppm && git fetch origin -q && git reset --hard origin/main && cd ..   # hard-sync (soft `git pull` no-ops on a diverged/detached clone)
+    # Track the checked-out branch, not a hardcoded main, so a dev/qa host stays
+    # on its branch. Detached HEAD falls back to main.
+    cd cppm
+    BR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true); case "$BR" in ""|HEAD) BR=main ;; esac
+    git fetch origin -q "$BR" && git reset --hard "origin/$BR"   # hard-sync (soft `git pull` no-ops on a diverged/detached clone)
+    cd ..
 else
     echo "🌐 Cloning CPPM Manager repository..."
-    git clone https://github.com/lbockenstedt/cppm.git
+    git clone --branch "${CPPM_BRANCH:-main}" https://github.com/lbockenstedt/cppm.git
 fi
 
 # The git clone/reset above ran as root; the spoke runs as svc_lm and
