@@ -65,8 +65,38 @@ def test_sync_endpoints_creates_new_endpoint(queries, mock_client):
 
 
 def test_sync_endpoints_replace_deletes_absent_tagged(queries, mock_client):
-    # One existing endpoint tagged for this tenant; empty incoming batch →
-    # it is absent → DELETE. (204 tolerated as SUCCESS by the client.)
+    """A tagged endpoint missing from a NON-empty batch is deleted."""
+    # Existing tagged endpoints: one is in the incoming batch, one is not.
+    mock_client.query.return_value = _hal([
+        {"id": 55, "mac_address": "11:22:33:44:55:66",
+         "attributes": {"NetBox_Tenant_Slug": "lrb"}},
+        {"id": 56, "mac_address": "aa:bb:cc:dd:ee:ff",
+         "attributes": {"NetBox_Tenant_Slug": "lrb"}},
+    ], 2)
+    mock_client._request.return_value = {"status": "SUCCESS"}
+
+    result = queries.sync_endpoints(
+        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        source="NetBox", replace=True,
+        endpoints=[{"ip": "172.16.1.62", "mac": "AA-BB-CC-DD-EE-FF", "hostname": "ws-01"}],
+    )
+
+    assert result["status"] == "SUCCESS"
+    assert result["removed"] == 1
+    deletes = [c for c in mock_client._request.call_args_list if c.args[0] == "DELETE"]
+    assert [c.args[1] for c in deletes] == ["/api/endpoint/55"]
+
+
+def test_sync_endpoints_replace_refuses_to_delete_on_empty_batch(queries, mock_client):
+    """An empty batch must NOT be treated as "delete everything".
+
+    Reconciling a tenant's tagged inventory against an empty batch would make
+    every tagged endpoint look absent and wipe the tenant. An upstream that
+    fails or returns nothing is far more likely than a genuine "remove all", so
+    the replace-scan aborts and the sync reports ERROR rather than silently
+    mass-deleting. This test previously asserted the opposite (SUCCESS with the
+    endpoint deleted) and was left behind when the guard was added.
+    """
     mock_client.query.return_value = _hal([
         {"id": 55, "mac_address": "11:22:33:44:55:66",
          "attributes": {"NetBox_Tenant_Slug": "lrb"}}
@@ -78,12 +108,36 @@ def test_sync_endpoints_replace_deletes_absent_tagged(queries, mock_client):
         source="NetBox", replace=True, endpoints=[],
     )
 
-    assert result["status"] == "SUCCESS"
-    assert result["pushed"] == 0
-    assert result["removed"] == 1
-    method, path = mock_client._request.call_args.args
-    assert method == "DELETE"
-    assert path == "/api/endpoint/55"
+    assert result["status"] == "ERROR"
+    assert result["removed"] == 0
+    # Nothing was deleted.
+    assert not [c for c in mock_client._request.call_args_list if c.args[0] == "DELETE"]
+
+
+def test_sync_endpoints_replace_aborts_runaway_removal(queries, mock_client):
+    """Guard 2: refuse when the removal set exceeds half the tagged inventory.
+
+    A truncated upstream batch looks legitimate but would delete most of the
+    tenant, so the scan bails before issuing any DELETE.
+    """
+    tagged = [
+        {"id": 60 + i, "mac_address": f"11:22:33:44:55:{i:02x}",
+         "attributes": {"NetBox_Tenant_Slug": "lrb"}}
+        for i in range(10)
+    ]
+    mock_client.query.return_value = _hal(tagged, len(tagged))
+    mock_client._request.return_value = {"status": "SUCCESS"}
+
+    # Batch carries only one of the ten tagged endpoints → 9/10 would be removed.
+    result = queries.sync_endpoints(
+        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        source="NetBox", replace=True,
+        endpoints=[{"ip": "172.16.1.62", "mac": "11:22:33:44:55:00", "hostname": "ws-00"}],
+    )
+
+    assert result["status"] == "ERROR"
+    assert result["removed"] == 0
+    assert not [c for c in mock_client._request.call_args_list if c.args[0] == "DELETE"]
 
 
 def test_sync_endpoints_ip_only_no_existing_is_skipped(queries, mock_client):
