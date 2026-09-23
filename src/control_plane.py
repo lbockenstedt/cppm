@@ -54,19 +54,28 @@ configure_logging()
 logger = logging.getLogger("CPPMControlPlane")
 
 class CPPMControlPlane(BaseControlPlane):
+    """Control plane connection manager for the CPPM spoke.
+
+    Manages WebSocket communication with the Lab Manager Hub and dispatches
+    incoming commands to the registered CPPMSpoke module.
+    """
+
     def get_service_name(self) -> str:
+        """Return systemd service name for health reporting."""
         return "lm-cppm"
 
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
+        """Initialize the CPPM control plane client."""
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.module_type = "nac"
 
     def register_module(self, name: str, module_instance: Any):
+        """Register a spoke module under a designated namespace."""
         self.modules[name] = module_instance
         logger.info(f"Registered module: {name}")
 
     async def run(self):
-        """Native LM Spoke behavior."""
+        """Connect to the Lab Manager Hub over WebSocket and handle messages."""
         logger.info(f"Starting CPPM Module in HUB MODE -> {self.hub_url}")
 
         # Initialize and register the CPPM module
@@ -74,8 +83,9 @@ class CPPMControlPlane(BaseControlPlane):
         self.register_module("cppm", cppm_spoke)
 
         await super().run()
+
     def run_standalone_mode(self):
-        """Standalone FastAPI server for local management."""
+        """Run standalone FastAPI server for local management when Hub URL is absent."""
         logger.info(f"Starting CPPM Module in STANDALONE MODE on port 8000")
         app = FastAPI()
         @app.get("/status")

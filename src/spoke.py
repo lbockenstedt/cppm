@@ -11,6 +11,7 @@ logger = logging.getLogger("CPPMSpoke")
 SENSITIVE_KEYS = {'password', 'secret', 'token', 'pass', 'auth_key', 'client_secret'}
 
 def _mask(data: Any) -> Any:
+    """Mask sensitive keys such as passwords and secret tokens in logged data."""
     if isinstance(data, dict):
         return {k: (_mask(v) if isinstance(v, (dict, list)) else ('********' if k.lower() in SENSITIVE_KEYS else v))
                 for k, v in data.items()}
@@ -19,11 +20,13 @@ def _mask(data: Any) -> Any:
     return data
 
 class CPPMSpoke:
-    """
-    Handles command execution for the CPPM spoke.
-    Maps Hub commands to CPPM API queries.
+    """Handles command execution for the CPPM spoke.
+
+    Maps Lab Manager Hub commands to ClearPass REST API queries, maintains
+    short-lived memory caches for dashboard views, and orchestrates certificate installs.
     """
     def __init__(self, spoke_id: str, config: Dict[str, Any]):
+        """Initialize the CPPM spoke instance with client and query handlers."""
         self.spoke_id = spoke_id
         self.config = config
         self.client = CPPMClient()
@@ -37,6 +40,7 @@ class CPPMSpoke:
         self._cache_ttl = 60.0
 
     def get_version(self) -> str:
+        """Read and return semantic version string from local VERSION file."""
         try:
             version_path = os.path.join(os.path.dirname(__file__), "../VERSION")
             if os.path.exists(version_path):
@@ -51,6 +55,7 @@ class CPPMSpoke:
         return asyncio.get_event_loop().run_in_executor(None, lambda: fn(*args, **kwargs))
 
     async def refresh_cache(self) -> Dict[str, Any]:
+        """Fetch fresh data for cached endpoints (Access Tracker, Device DB, NAC Status)."""
         refresh_map = {
             "CPPM_GET_ACCESS_TRACKER": self.queries.get_access_tracker,
             "CPPM_GET_DEVICE_DATABASE": self.queries.get_device_database,
@@ -72,6 +77,7 @@ class CPPMSpoke:
         return {"status": "SUCCESS", "refreshed": results}
 
     async def handle_command(self, cmd_type: str, data: Dict[str, Any]) -> Any:
+        """Dispatch incoming hub command to the corresponding CPPM client or query method."""
         normalized = cmd_type.upper()
         logger.info(f"CPPM command: {normalized} | data: {_mask(data)}")
 

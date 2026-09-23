@@ -514,6 +514,7 @@ class CPPMQueries:
     # --- Existing queries ---
 
     def get_device_by_mac(self, mac: str) -> Optional[Dict[str, Any]]:
+        """Look up an endpoint record in ClearPass by its MAC address."""
         result = self.client.query("/api/endpoint", params={"filter": json.dumps({"mac_address": mac}, separators=(",", ":"))})
         items = self._items(result)
         return items[0] if items else None
@@ -1224,10 +1225,12 @@ class CPPMQueries:
         return {"status": "SUCCESS", "sessions": sessions, "total": total}
 
     def get_user_sessions(self, username: str) -> List[Dict[str, Any]]:
+        """Query active and historical sessions associated with a specific username."""
         result = self.client.query("/api/session", params={"filter": json.dumps({"username": username}, separators=(",", ":"))})
         return self._items(result)
 
     def get_auth_logs(self, start_time: str, end_time: str) -> List[Dict[str, Any]]:
+        """Retrieve authentication session logs within an ISO timestamp window."""
         result = self.client.query(
             "/api/session",
             params={"filter": json.dumps({"acctstarttime": {"$gte": start_time, "$lte": end_time}}, separators=(",", ":"))},
@@ -1451,10 +1454,12 @@ class CPPMQueries:
         return {"status": "SUCCESS", "results": unique, "count": len(unique)}
 
     def list_roles(self) -> List[Dict[str, Any]]:
+        """Fetch all configured user and device roles defined in ClearPass."""
         result = self.client.query("/api/role")
         return self._items(result)
 
     def get_system_health(self) -> Dict[str, Any]:
+        """Query ClearPass server version and health status."""
         result = self.client.query("/api/server/version")
         if isinstance(result, dict) and result.get("status") != "ERROR":
             return {"status": "SUCCESS", "version": result.get("app_major_version", ""), "details": result}

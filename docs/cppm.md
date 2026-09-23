@@ -17,11 +17,11 @@ NAC spoke — endpoint auditing, session/access-tracker monitoring, and a hub-or
 
 ## Ports / backends
 
-Talks to ClearPass REST (`CPPMClient`, `src/client.py`, `requests.Session`, TLS verify off). Auth: OAuth2 (`POST /api/oauth`) with **password grant preferred over client_credentials** when user creds are available (inherits the user's operator profile vs the API client's restricted profile); falls back to basic auth. Token cached with expiry (`expires_in`, 30s skew). Endpoints: `/api/session` (access tracker / recent sessions / user sessions / NAC status), `/api/endpoint` (device DB, by-MAC, by-IP, upsert/sync), `/api/role`. Standalone mode serves :8000.
+Talk to ClearPass REST (`CPPMClient`, `src/client.py`, `requests.Session`, TLS verify configurable via `verify_ssl` / `LM_CPPM_VERIFY_TLS`). Auth: OAuth2 (`POST /api/oauth`) with **password grant preferred over client_credentials** when user creds are available (inherits the user's operator profile vs the API client's restricted profile); falls back to basic auth. Token cached with expiry (`expires_in`, 30s skew). Endpoints: `/api/session` (access tracker / recent sessions / user sessions / NAC status), `/api/endpoint` (device DB, by-MAC, by-IP, upsert/sync), `/api/role`. Standalone mode serves :8000.
 
 ## Environment variables
 
-`.env.example` (loaded by `client.py`'s hand-rolled `load_dotenv()`): `CPPM_HOST`, `CPPM_CLIENT_ID`, `CPPM_CLIENT_SECRET`, `CPPM_USER`, `CPPM_PASS`; plus `SPOKE_ID`, `SPOKE_SECRET`, `HUB_URL`. Connection config also pushable via `UPDATE_CONFIG`.
+`.env.example` (loaded by `client.py`'s hand-rolled `load_dotenv()`): `CPPM_HOST`, `CPPM_CLIENT_ID`, `CPPM_CLIENT_SECRET`, `CPPM_USER`, `CPPM_PASS`; plus `SPOKE_ID`, `SPOKE_SECRET`, `HUB_URL`, `LM_CPPM_VERIFY_TLS`. Connection config also pushable via `UPDATE_CONFIG`.
 
 ## Install flags
 
@@ -29,11 +29,11 @@ Talks to ClearPass REST (`CPPMClient`, `src/client.py`, `requests.Session`, TLS 
 
 ## Key commands / handlers (`spoke.handle_command`, via `run_in_executor` — `CPPMQueries` is sync `requests`)
 
-`GET_VERSION`, `CPPM_REFRESH_CACHE`, `UPDATE_CONFIG`, `TEST_AUTH` (tries every OAuth candidate, reports per-attempt), `PROBE_API` (raw `_request`). Cached: `CPPM_GET_ACCESS_TRACKER`, `CPPM_GET_DEVICE_DATABASE`, `CPPM_GET_NAC_STATUS`. Live: `CPPM_GET_RECENT_SESSIONS` (last `lookback_minutes` default 2 — **not cached**, time-sensitive, called ~60s by the hub realtime NAC→IPAM loop), `CPPM_GET_SYSTEM_HEALTH`, `GET_DEVICE` (by MAC), `LIST_ENDPOINTS`, `GET_ENDPOINT_DETAIL`, `GET_DEVICE_SESSIONS`, `GET_USER_SESSIONS`, `GET_LOGS` (auth logs by start/end), `LIST_ROLES`, `SEARCH_SESSIONS`, `CPPM_SYNC_ENDPOINTS` (hub-orchestrated IPAM→ClearPass: upserts a tenant's endpoint batch tagged `NetBox_Tenant_Slug`/`_Name`/`_ID` + `Tenant`/`Tenant_Slug` + `IP Address`/`Hostname`/`status:Known`; `replace=True` deletes endpoints previously tagged with this tenant absent from the batch; MAC-keyed upsert with IP fallback; IP-only records with no existing endpoint skipped; per-endpoint failures counted, never raised).
+`GET_VERSION`, `CPPM_REFRESH_CACHE`, `UPDATE_CONFIG`, `TEST_AUTH` (tries every OAuth candidate, reports per-attempt), `PROBE_API` (raw `_request`). Cached: `CPPM_GET_ACCESS_TRACKER`, `CPPM_GET_DEVICE_DATABASE`, `CPPM_GET_NAC_STATUS`. Live: `CPPM_GET_RECENT_SESSIONS` (last `lookback_minutes` default 2 — **not cached**, time-sensitive, called ~60s by the hub realtime NAC→IPAM loop), `CPPM_GET_SYSTEM_HEALTH`, `GET_DEVICE` (by MAC), `LIST_ENDPOINTS`, `GET_ENDPOINT_DETAIL`, `GET_DEVICE_SESSIONS`, `GET_USER_SESSIONS`, `GET_LOGS` (auth logs by start/end), `LIST_ROLES`, `SEARCH_SESSIONS`, `CPPM_SYNC_ENDPOINTS` (hub-orchestrated IPAM→ClearPass: upserts a tenant's endpoint batch tagged `NetBox_Tenant_Slug`/`_Name`/`_ID` + `Tenant`/`Tenant_Slug` + `IP Address`/`Hostname`/`status:Known`; `replace=True` deletes endpoints previously tagged with this tenant absent from the batch; MAC-keyed upsert with IP fallback; IP-only records with no existing endpoint skipped; per-endpoint failures counted, never raised), `INSTALL_CERT` (hub-brokered ACME TLS certificate delivery, PKCS#12 conversion, Certificate Trust List / CTL root enrollment, and HTTPS/RADIUS service binding).
 
 ## Key files
 
-`src/control_plane.py` (+ standalone FastAPI), `src/spoke.py` (~251 lines — `CPPMSpoke` non-BaseSpoke, dispatch, cache, `SENSITIVE_KEYS` masking), `src/client.py` (~178 lines — `CPPMClient`: `load_dotenv`, OAuth `_get_token`/`_try_oauth`, `_request`/`query`, `update_config`, 204-tolerant empty-body), `src/queries.py` (~1153 lines — `CPPMQueries`: all the get_* + `sync_endpoints` + helpers `_nas_*`, `_iso_dt`, `_norm_mac`, `_coerce_attrs`, `_endpoint_ips`, `_build_ip/mac_endpoint_map`, `_get_endpoint_by_ip`, `_upsert_endpoint`), `src/main.py` (demo), `install.sh`, `API_SPEC.md`, `requirements.txt`, `VERSION`.
+`src/control_plane.py` (+ standalone FastAPI), `src/spoke.py` (`CPPMSpoke` non-BaseSpoke, dispatch, cache, `SENSITIVE_KEYS` masking), `src/client.py` (`CPPMClient`: `load_dotenv`, OAuth `_get_token`/`_try_oauth`, `_request`/`query`, `update_config`, 204-tolerant empty-body, TLS verification toggles), `src/queries.py` (`CPPMQueries`: all the get_* + `sync_endpoints` + `import_cert` + helpers `_nas_*`, `_iso_dt`, `_norm_mac`, `_coerce_attrs`, `_endpoint_ips`, `_build_ip/mac_endpoint_map`, `_get_endpoint_by_ip`, `_upsert_endpoint`), `src/main.py` (demo), `install.sh`, `API_SPEC.md`, `requirements.txt`, `VERSION`.
 
 ## Notable behaviors & gotchas
 
@@ -42,6 +42,7 @@ Talks to ClearPass REST (`CPPMClient`, `src/client.py`, `requests.Session`, TLS 
 - **In-memory cache** for `CPPM_GET_ACCESS_TRACKER`/`CPPM_GET_DEVICE_DATABASE`/`CPPM_GET_NAC_STATUS` only; `CPPM_GET_RECENT_SESSIONS` deliberately uncached (realtime loop).
 - **Token strategy** — password grant with `client_id` (configured, then `ClearPass`), then password grant with no `client_id`, then `client_credentials` (user operator profile > API client profile). Tolerates empty 204 bodies on DELETE.
 - **`CPPM_SYNC_ENDPOINTS` tenant tagging** uses the same attribute names the at-auth-time Context Server Action uses (`NetBox_Tenant_Slug` etc.) so an Enforcement Policy matches the tenant whether the endpoint was synced in advance or tagged at auth time.
+- **`INSTALL_CERT` Certificate Trust List & PKCS#12 generation** — installs leaf, intermediate, and detected root CAs (ISRG Root X1/X2) into ClearPass CTL before binding server certificate to avoid 422 errors.
 
 ## Related pages
 
