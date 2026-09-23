@@ -5,6 +5,7 @@ import logging
 from typing import Any, Dict, Optional
 
 def load_dotenv():
+    """Load environment variables from a local .env file if present."""
     if os.path.exists(".env"):
         with open(".env") as f:
             for line in f:
@@ -36,6 +37,7 @@ def _as_bool(value: Any) -> bool:
 
 
 def _env_verify_tls() -> bool:
+    """Read LM_CPPM_VERIFY_TLS env var to determine default TLS verification mode."""
     value = os.getenv("LM_CPPM_VERIFY_TLS", "true").strip().lower()
     if value in {"0", "false", "no", "off"}:
         logger.warning("CPPM TLS certificate verification disabled via LM_CPPM_VERIFY_TLS=%s. "
@@ -45,9 +47,9 @@ def _env_verify_tls() -> bool:
 
 
 class CPPMClient:
-    """
-    REST client for Aruba ClearPass Policy Manager.
-    Auth priority: OAuth2 client_credentials (preferred) → basic auth fallback.
+    """REST client for Aruba ClearPass Policy Manager.
+
+    Auth priority: OAuth2 password grant (preferred) -> client_credentials -> basic auth fallback.
     """
     def __init__(
         self,
@@ -58,6 +60,7 @@ class CPPMClient:
         client_secret: Optional[str] = None,
         verify_ssl: Optional[bool] = None,
     ):
+        """Initialize the ClearPass REST client with endpoint credentials and TLS configuration."""
         self.host = host or os.getenv("CPPM_HOST", "")
         self.user = user or os.getenv("CPPM_USER", "")
         self.password = password or os.getenv("CPPM_PASS", "")
@@ -81,6 +84,7 @@ class CPPMClient:
     def update_config(self, host: str, user: str = "", password: str = "",
                       client_id: str = "", client_secret: str = "",
                       verify_ssl: Optional[bool] = None):
+        """Update host address, credentials, and SSL verification settings dynamically."""
         self.host = host
         self.user = user
         self.password = password
@@ -94,6 +98,7 @@ class CPPMClient:
         logger.info(f"CPPM client reconfigured for host: {host} (verify_ssl={self.session.verify})")
 
     def _base_url(self) -> str:
+        """Construct normalized base HTTPS URL for ClearPass API requests."""
         host = self.host.strip()
         if not host.startswith(("http://", "https://")):
             host = f"https://{host}"
@@ -126,6 +131,7 @@ class CPPMClient:
             return None
 
     def _get_token(self) -> Optional[str]:
+        """Retrieve valid OAuth2 bearer token from cache or request a new one."""
         if self._token and time.time() < self._token_expiry - 30:
             return self._token
 
@@ -169,6 +175,7 @@ class CPPMClient:
         return None
 
     def _request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
+        """Execute an authenticated HTTP request against ClearPass REST API."""
         if not self.host:
             return {"status": "ERROR", "message": "CPPM host not configured"}
 
@@ -233,4 +240,5 @@ class CPPMClient:
             return {"status": "ERROR", "message": "Non-JSON response from CPPM"}
 
     def query(self, endpoint: str, params: Optional[Dict] = None) -> Dict[str, Any]:
+        """Perform a GET query against ClearPass REST API with optional query parameters."""
         return self._request("GET", endpoint, params=params)
