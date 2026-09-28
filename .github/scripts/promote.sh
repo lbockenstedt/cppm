@@ -85,11 +85,9 @@ fi
 [ "${#units[@]}" -gt 0 ] || units=("origin/$SRC")
 
 # Build $BR as "$TGT plus everything up to <endpoint>", VERSION pinned.
-# Returns 0 when that produced a real change and 1 when it is a content no-op.
-# There is no third return code: a merge conflict outside VERSION is fatal --
-# the function prints ::error:: and `exit 1`s the whole script, so no caller
-# ever regains control after a conflict. Do not write code that expects to
-# handle a conflict here unless you first change that `exit 1` into a return.
+# Returns 0 when that produced a real change, 1 when it is a content no-op, and
+# 2 when the merge conflicts outside VERSION. A conflict does NOT exit the
+# script: the caller decides its severity (every caller must handle 2).
 stage_to() {
   local endpoint="$1"
 
@@ -137,9 +135,11 @@ stage_to() {
 picked=""
 picked_idx=0
 conflicted=0
+last_rc=0
 for i in "${!units[@]}"; do
   sel_rc=0
   stage_to "${units[$i]}" || sel_rc=$?
+  last_rc="$sel_rc"
   if [ "$sel_rc" -eq 0 ]; then
     picked="${units[$i]}"
     picked_idx="$i"
@@ -168,11 +168,12 @@ for i in "${!units[@]}"; do
   [ "$SPLIT" = "1" ] && echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
 done
 
-# Every endpoint conflicted, including the tip of $SRC. That is a real
+# The final endpoint (the tip of $SRC) itself conflicted. That is a real
 # divergence a human must reconcile -- and it must NOT fall through to the
 # "Nothing to promote" branch below, which would report success while
-# promoting nothing.
-if [ -z "$picked" ] && [ "$conflicted" -eq 1 ]; then
+# promoting nothing. If only earlier units conflicted but the tip merged
+# cleanly as a no-op, $TGT already contains $SRC and that is not an error.
+if [ -z "$picked" ] && [ "$last_rc" -eq 2 ]; then
   echo "::error::merge conflict outside VERSION -- resolve $SRC -> $TGT by hand"
   exit 1
 fi
@@ -228,11 +229,14 @@ if [ "$SPLIT" = "1" ]; then
       picked="${units[$ext_idx]}"
       picked_idx="$ext_idx"
     else
-      # stage_to only ever returns 0 or 1 -- a conflict exits the script inside
-      # the function, so the only way to land here is the no-op code 1 (which a
-      # superset of a real change should never produce). Report it as what it
-      # actually is rather than guessing at a conflict that cannot reach here.
-      echo "::warning::extension to ${units[$ext_idx]} reported no content change (exit $ext_rc) -- keeping unit $picked_idx"
+      # stage_to returns 1 for a content no-op or 2 for a merge conflict
+      # outside VERSION. Either way fall back to the original unit, reporting
+      # which state actually occurred.
+      if [ "$ext_rc" -eq 2 ]; then
+        echo "::warning::extension to ${units[$ext_idx]} conflicts against $TGT (exit $ext_rc) -- keeping unit $picked_idx"
+      else
+        echo "::warning::extension to ${units[$ext_idx]} reported no content change (exit $ext_rc) -- keeping unit $picked_idx"
+      fi
       # The failed extension left the worktree staged against the WRONG endpoint,
       # so the original unit has to be restaged before anything is committed.
       # Discarding this exit code (|| true) defeated the fallback entirely: a
