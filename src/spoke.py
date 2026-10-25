@@ -274,6 +274,25 @@ class CPPMSpoke:
                 ),
             )
 
+        if normalized in ("CPPM_CREATE_LOCAL_USER", "CPPM_SET_LOCAL_USER_PASSWORD",
+                          "CPPM_DELETE_LOCAL_USER", "CPPM_GET_LOCAL_USER"):
+            # Hub dot1x_jit broker: Policy Manager local users backing
+            # simulated 802.1X identities. See CPPMQueries local-user section.
+            uid = data.get("user_id") or data.get("username") or ""
+            if normalized == "CPPM_CREATE_LOCAL_USER":
+                fn = lambda: self.queries.create_local_user(
+                    uid, data.get("password") or "",
+                    role_name=data.get("role_name") or "[Employee]",
+                    tenant_slug=data.get("tenant_slug") or "",
+                    attributes=data.get("attributes") or None)
+            elif normalized == "CPPM_SET_LOCAL_USER_PASSWORD":
+                fn = lambda: self.queries.set_local_user_password(uid, data.get("password") or "")
+            elif normalized == "CPPM_DELETE_LOCAL_USER":
+                fn = lambda: self.queries.delete_local_user(uid)
+            else:
+                fn = lambda: self.queries.get_local_user(uid)
+            return await asyncio.get_event_loop().run_in_executor(None, fn)
+
         if normalized == "INSTALL_CERT":
             # Hub-brokered cert distribution: install the delivered LE cert as
             # a ClearPass server cert. Default service is HTTPS(RSA) (the admin

@@ -54,6 +54,17 @@ The CPPM Spoke integrates Lab Manager with Aruba ClearPass Policy Manager (CPPM)
     nor IP are dropped by the hub.
   - **Response**: `{"status": "SUCCESS"|"ERROR", "pushed": <int>, "errors": <int>, "skipped": <int>, "removed": <int>, "message": "..."}`
 
+### Local Users (JIT 802.1X)
+Used by the hub's `dot1x_jit` broker to create Policy Manager local users for
+simulated 802.1X clients. Every user it creates carries the attribute
+`LM_Managed: dot1x_jit` (plus `Tenant_Slug`); create refuses to take over an
+existing local user without that marker.
+- **`CPPM_CREATE_LOCAL_USER`** — `{"user_id": "jsmith", "password": "...", "role_name": "[Employee]", "tenant_slug": "lrb"}` →
+  `{"status", "user_id", "created": bool}`. An existing LM-managed user is re-keyed (PATCH); a non-managed one returns `ERROR` with `code: 409`.
+- **`CPPM_SET_LOCAL_USER_PASSWORD`** — `{"user_id", "password"}` → `{"status", "user_id"}`.
+- **`CPPM_DELETE_LOCAL_USER`** — `{"user_id"}` → `{"status", "user_id", "deleted": bool}` (absent = success, `deleted: false`).
+- **`CPPM_GET_LOCAL_USER`** — `{"user_id"}` → `{"status", "found": bool, "user"}` (password never returned).
+
 ## Integration Flow
 1. **Command Trigger**: The Hub sends a signed WebSocket message (e.g., `get_device`).
 2. **Execution**: `CPPMSpoke` routes the command to `CPPMQueries`.

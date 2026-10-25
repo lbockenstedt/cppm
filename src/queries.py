@@ -4,6 +4,7 @@ import datetime as _dt
 import json
 import logging
 import re
+from urllib.parse import quote
 
 logger = logging.getLogger("CPPMQueries")
 
@@ -542,6 +543,89 @@ class CPPMQueries:
             "device_type": attrs.get("Device Type", attrs.get("device_type", "")),
             "attributes": {k: v for k, v in attrs.items() if v},
         }
+
+    # --- Policy Manager local users (hub JIT 802.1X accounts) ---
+    # The hub's dot1x_jit broker creates one local user per simulated 802.1X
+    # identity, owns the random password (vault), rotates it and deletes the
+    # user when the sim engine releases it. Every user it creates carries the
+    # LOCAL_USER_MARKER attribute; create refuses to take over an existing
+    # local user without it so a hand-made account is never overwritten.
+    LOCAL_USER_MARKER = "LM_Managed"
+    LOCAL_USER_MARKER_VALUE = "dot1x_jit"
+
+    @staticmethod
+    def _local_user_path(user_id: str) -> str:
+        return f"/api/local-user/user-id/{quote(str(user_id), safe='')}"
+
+    def get_local_user(self, user_id: str) -> Dict[str, Any]:
+        """Fetch a Policy Manager local user. Returns {status, found, user}."""
+        user_id = (user_id or "").strip()
+        if not user_id:
+            return {"status": "ERROR", "message": "Missing user_id"}
+        res = self.client._request("GET", self._local_user_path(user_id))
+        if isinstance(res, dict) and res.get("status") == "ERROR":
+            if res.get("code") == 404:
+                return {"status": "SUCCESS", "found": False}
+            return res
+        user = dict(res or {})
+        user.pop("password", None)
+        return {"status": "SUCCESS", "found": True, "user": user}
+
+    def create_local_user(self, user_id: str, password: str,
+                          role_name: str = "[Employee]", tenant_slug: str = "",
+                          attributes: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Create (or re-key, when already LM-managed) a local user."""
+        user_id = (user_id or "").strip()
+        if not user_id or not password:
+            return {"status": "ERROR", "message": "user_id and password are required"}
+        existing = self.get_local_user(user_id)
+        if existing.get("status") == "ERROR":
+            return existing
+        attrs = {k: str(v) for k, v in (attributes or {}).items() if v not in (None, "")}
+        attrs[self.LOCAL_USER_MARKER] = self.LOCAL_USER_MARKER_VALUE
+        if tenant_slug:
+            attrs["Tenant_Slug"] = tenant_slug
+        if existing.get("found"):
+            cur = (existing.get("user") or {}).get("attributes") or {}
+            if cur.get(self.LOCAL_USER_MARKER) != self.LOCAL_USER_MARKER_VALUE:
+                return {"status": "ERROR", "code": 409,
+                        "message": f"local user {user_id!r} exists and is not LM-managed"}
+            res = self.client._request("PATCH", self._local_user_path(user_id), json={
+                "password": password, "role_name": role_name, "enabled": True,
+                "attributes": {**cur, **attrs}})
+            if isinstance(res, dict) and res.get("status") == "ERROR":
+                return res
+            return {"status": "SUCCESS", "user_id": user_id, "created": False}
+        res = self.client._request("POST", "/api/local-user", json={
+            "user_id": user_id, "username": user_id, "password": password,
+            "role_name": role_name, "enabled": True,
+            "change_pwd_next_login": False, "attributes": attrs})
+        if isinstance(res, dict) and res.get("status") == "ERROR":
+            return res
+        return {"status": "SUCCESS", "user_id": user_id, "created": True}
+
+    def set_local_user_password(self, user_id: str, password: str) -> Dict[str, Any]:
+        """Replace a local user's password."""
+        user_id = (user_id or "").strip()
+        if not user_id or not password:
+            return {"status": "ERROR", "message": "user_id and password are required"}
+        res = self.client._request("PATCH", self._local_user_path(user_id),
+                                   json={"password": password})
+        if isinstance(res, dict) and res.get("status") == "ERROR":
+            return res
+        return {"status": "SUCCESS", "user_id": user_id}
+
+    def delete_local_user(self, user_id: str) -> Dict[str, Any]:
+        """Delete a local user. Already-absent counts as success."""
+        user_id = (user_id or "").strip()
+        if not user_id:
+            return {"status": "ERROR", "message": "Missing user_id"}
+        res = self.client._request("DELETE", self._local_user_path(user_id))
+        if isinstance(res, dict) and res.get("status") == "ERROR":
+            if res.get("code") == 404:
+                return {"status": "SUCCESS", "user_id": user_id, "deleted": False}
+            return res
+        return {"status": "SUCCESS", "user_id": user_id, "deleted": True}
 
     # --- NetBox → ClearPass endpoint sync (CPPM_SYNC_ENDPOINTS) ---
     # The hub owns the schedule and the batch; this spoke writes it into
