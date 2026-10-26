@@ -271,6 +271,9 @@ class CPPMSpoke:
                     source=data.get("source", ""),
                     endpoints=data.get("endpoints", []) or [],
                     replace=bool(data.get("replace", True)),
+                    # Operator-confirmed one-off: lets a sync remove more than
+                    # half of the tenant's tagged endpoints (hub admin-ops).
+                    allow_mass_remove=data.get("allow_mass_remove") is True,
                 ),
             )
 
