@@ -436,3 +436,41 @@ def test_upsert_put_name_truncated_to_255(queries, mock_client):
     body = mock_client._request.call_args.kwargs["json"]
     assert len(body["name"]) == 255
     assert body["name"] == "x" * 255
+
+
+def test_sync_endpoints_allow_mass_remove_bypasses_runaway_guard(queries, mock_client):
+    """An operator-confirmed shrink (allow_mass_remove) deletes the absent
+    endpoints even past the 50% guard."""
+    tagged = [
+        {"id": 60 + i, "mac_address": f"11:22:33:44:55:{i:02x}",
+         "attributes": {"NetBox_Tenant_Slug": "lrb"}}
+        for i in range(10)
+    ]
+    mock_client.query.return_value = _hal(tagged, len(tagged))
+    mock_client._request.return_value = {"status": "SUCCESS"}
+
+    result = queries.sync_endpoints(
+        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        source="NetBox", replace=True, allow_mass_remove=True,
+        endpoints=[{"ip": "172.16.1.62", "mac": "11:22:33:44:55:00", "hostname": "ws-00"}],
+    )
+
+    deletes = [c for c in mock_client._request.call_args_list if c.args[0] == "DELETE"]
+    assert result["removed"] == 9
+    assert len(deletes) == 9
+
+
+def test_sync_endpoints_allow_mass_remove_still_refuses_empty_batch(queries, mock_client):
+    """Guard 1 (empty batch) is never bypassed."""
+    tagged = [{"id": 1, "mac_address": "11:22:33:44:55:01",
+               "attributes": {"NetBox_Tenant_Slug": "lrb"}}]
+    mock_client.query.return_value = _hal(tagged, 1)
+    mock_client._request.return_value = {"status": "SUCCESS"}
+
+    result = queries.sync_endpoints(
+        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        source="NetBox", replace=True, allow_mass_remove=True, endpoints=[],
+    )
+
+    assert result["removed"] == 0
+    assert not [c for c in mock_client._request.call_args_list if c.args[0] == "DELETE"]

@@ -961,7 +961,8 @@ class CPPMQueries:
             return "error"
         return "pushed"
 
-    def _remove_absent_tagged(self, tenant_slug: str, batch_keys: set) -> int:
+    def _remove_absent_tagged(self, tenant_slug: str, batch_keys: set,
+                              allow_mass_remove: bool = False) -> int:
         """Delete endpoints tagged with this tenant whose key is not in the batch.
 
         Pages through /api/endpoint and filters client-side by the tenant
@@ -978,6 +979,10 @@ class CPPMQueries:
              removal set would exceed 50% of it, the scan aborts without
              deleting. Both raise ``ReplaceScanAborted`` so the sync surfaces
              an ERROR rather than silently mass-deleting.
+
+        ``allow_mass_remove`` skips guard 2 only, for a one-off sync an operator
+        has confirmed (the tenant's IPAM data really did shrink). Guard 1 always
+        applies.
         """
         # Guard 1: an empty batch means the upstream produced no endpoints
         # (empty/truncated/failed). Reconciling against nothing would delete
@@ -1026,7 +1031,8 @@ class CPPMQueries:
         # Guard 2: refuse a removal that would take out more than half of the
         # tenant's currently-tagged endpoints — the signature of a truncated or
         # partially-failed batch. Surface it loudly instead of deleting.
-        if tagged_total and len(to_delete) > tagged_total * 0.5:
+        if (not allow_mass_remove and tagged_total
+                and len(to_delete) > tagged_total * 0.5):
             raise ReplaceScanAborted(
                 f"replace-scan for tenant '{tenant_slug}' would remove "
                 f"{len(to_delete)} of {tagged_total} tagged endpoints (>50%) — "
@@ -1044,7 +1050,8 @@ class CPPMQueries:
 
     def sync_endpoints(self, tenant_id: str, tenant_slug: str, tenant_name: str,
                        source: str, endpoints: List[Dict[str, Any]],
-                       replace: bool = True) -> Dict[str, Any]:
+                       replace: bool = True,
+                       allow_mass_remove: bool = False) -> Dict[str, Any]:
         """Sync a tenant's endpoint batch into ClearPass Device Inventory.
 
         Upserts each endpoint (keyed on MAC, falling back to IP) tagged with the
@@ -1193,7 +1200,8 @@ class CPPMQueries:
         removed = 0
         if replace:
             try:
-                removed = self._remove_absent_tagged(tenant_slug, batch_keys)
+                removed = self._remove_absent_tagged(
+                    tenant_slug, batch_keys, allow_mass_remove=allow_mass_remove)
             except ReplaceScanAborted as e:
                 # Deliberate safety abort (empty/runaway batch) — count it as an
                 # error so the sync reports ERROR rather than a silent success
