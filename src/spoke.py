@@ -205,7 +205,7 @@ class CPPMSpoke:
             return {"status": "SUCCESS", "device": res} if res else {"status": "ERROR", "message": "Device not found"}
 
         if normalized == "LIST_ENDPOINTS":
-            return await asyncio.get_event_loop().run_in_executor(None, self.queries.get_device_database)
+            return await asyncio.get_event_loop().run_in_executor(None, self.queries.get_all_endpoints)
 
         if normalized == "GET_ENDPOINT_DETAIL":
             mac = data.get("mac")
