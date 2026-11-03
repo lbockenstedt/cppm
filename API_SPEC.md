@@ -59,6 +59,8 @@ Used by the hub's `dot1x_jit` broker to create Policy Manager local users for
 simulated 802.1X clients. Every user it creates carries the attribute
 `LM_Managed: dot1x_jit` (plus `Tenant_Slug`); create refuses to take over an
 existing local user without that marker.
+- **`CPPM_SYNC_NADS`** — `{"tenant_id": "dxp", "tenant_name": "DXP", "subnets": ["10.0.0.0/8"], "radius_secret": "...", "tacacs_secret": "..."}` →
+  `{"status": "SUCCESS"|"PARTIAL"|"ERROR", "created", "updated", "removed", "errors", "error_details"}`. One Network Device per subnet (`LM-<tenant>-<subnet>`, vendor Aruba, description `LM-managed tenant=<tenant>; …`); the tenant's LM-managed devices whose subnet is gone are deleted. Devices without the marker are never touched. At least one secret is required.
 - **`CPPM_CREATE_LOCAL_USER`** — `{"user_id": "jsmith", "password": "...", "role_name": "[Employee]", "tenant_slug": "lrb"}` →
   `{"status", "user_id", "created": bool}`. An existing LM-managed user is re-keyed (PATCH); a non-managed one returns `ERROR` with `code: 409`.
 - **`CPPM_SET_LOCAL_USER_PASSWORD`** — `{"user_id", "password"}` → `{"status", "user_id"}`.
