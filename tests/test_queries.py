@@ -204,3 +204,16 @@ def test_get_device_sessions_falls_back_to_client_side_scan_on_filter_error(quer
     assert res["status"] == "SUCCESS"
     assert len(res["sessions"]) == 1            # only the MAC match, not `other`
     assert res["sessions"][0]["ip"] == "10.0.0.5"
+
+
+def test_get_all_endpoints_pages_past_the_first_page(queries, mock_client):
+    def page(path, params):
+        start = params["offset"]
+        rows = [{"mac_address": f"m{i}"} for i in range(start, min(start + 2, 5))]
+        return {"count": 5, "_embedded": {"items": rows}}
+    mock_client.query.side_effect = page
+
+    res = queries.get_all_endpoints(page_size=2)
+
+    assert [d["mac"] for d in res["devices"]] == ["m0", "m1", "m2", "m3", "m4"]
+    assert res["total"] == 5
