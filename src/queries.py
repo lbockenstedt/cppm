@@ -1900,3 +1900,77 @@ class CPPMQueries:
                 "message": f"cert '{domain or 'lm-le'}' installed as {service_name} "
                            f"on ClearPass server {server_uuid}",
                 "trust_list": trust_results}
+
+    # --- Network Devices (RADIUS/TACACS clients) per tenant subnet ---
+    # The hub sends each tenant's subnets plus the shared secrets from the
+    # tenant's "radius" vault secret. LM owns only the devices whose
+    # description carries NAD_MARKER for that tenant; anything else is left alone.
+
+    NAD_MARKER = "LM-managed tenant="
+
+    def _list_network_devices(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        offset = 0
+        while True:
+            res = self.client._request("GET", "/api/network-device",
+                                       params={"limit": 1000, "offset": offset})
+            if isinstance(res, dict) and res.get("status") == "ERROR":
+                raise RuntimeError(res.get("message") or "network-device list failed")
+            page = self._items(res)
+            out.extend(page)
+            if len(page) < 1000:
+                return out
+            offset += 1000
+
+    def sync_network_devices(self, tenant_id: str, tenant_name: str, subnets: List[str],
+                             radius_secret: str = "", tacacs_secret: str = "") -> Dict[str, Any]:
+        """Make the tenant's LM-managed Network Devices match ``subnets``:
+        create or update one device per subnet (name ``LM-<tenant>-<subnet>``)
+        with the shared secrets, and delete the tenant's LM-managed devices
+        whose subnet is gone. Returns {status, created, updated, removed,
+        errors, error_details}."""
+        tenant_id = (tenant_id or "").strip()
+        if not tenant_id or not subnets or not (radius_secret or tacacs_secret):
+            return {"status": "ERROR",
+                    "message": "tenant_id, subnets and a RADIUS or TACACS secret are required"}
+        marker = f"{self.NAD_MARKER}{tenant_id}"
+        try:
+            existing = {d.get("name"): d for d in self._list_network_devices()
+                        if marker == str(d.get("description") or "").split(";")[0]}
+        except RuntimeError as e:
+            return {"status": "ERROR", "message": str(e)}
+        result = {"created": 0, "updated": 0, "removed": 0, "errors": 0, "error_details": []}
+        wanted = set()
+        for subnet in subnets:
+            name = f"LM-{tenant_id}-{subnet.replace('/', '_')}"
+            wanted.add(name)
+            body = {"name": name, "ip_address": subnet,
+                    "description": f"{marker}; {tenant_name or tenant_id} subnet (managed by LM)"}
+            if radius_secret:
+                body["radius_secret"] = radius_secret
+            if tacacs_secret:
+                body["tacacs_secret"] = tacacs_secret
+            if name in existing:
+                res = self.client._request("PATCH", f"/api/network-device/{existing[name]['id']}",
+                                           json=body)
+                key = "updated"
+            else:
+                res = self.client._request("POST", "/api/network-device",
+                                           json={**body, "vendor_name": "Aruba"})
+                key = "created"
+            if isinstance(res, dict) and res.get("status") == "ERROR":
+                result["errors"] += 1
+                result["error_details"].append(f"{subnet}: {res.get('message')}")
+            else:
+                result[key] += 1
+        for name, dev in existing.items():
+            if name in wanted:
+                continue
+            res = self.client._request("DELETE", f"/api/network-device/{dev['id']}")
+            if isinstance(res, dict) and res.get("status") == "ERROR":
+                result["errors"] += 1
+                result["error_details"].append(f"remove {name}: {res.get('message')}")
+            else:
+                result["removed"] += 1
+        result["status"] = "SUCCESS" if not result["errors"] else "PARTIAL"
+        return result
