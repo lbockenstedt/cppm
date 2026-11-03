@@ -8,7 +8,8 @@ import time
 
 logger = logging.getLogger("CPPMSpoke")
 
-SENSITIVE_KEYS = {'password', 'secret', 'token', 'pass', 'auth_key', 'client_secret'}
+SENSITIVE_KEYS = {'password', 'secret', 'token', 'pass', 'auth_key', 'client_secret',
+                  'radius_secret', 'tacacs_secret'}
 
 def _mask(data: Any) -> Any:
     """Mask sensitive keys such as passwords and secret tokens in logged data."""
@@ -276,6 +277,15 @@ class CPPMSpoke:
                     allow_mass_remove=data.get("allow_mass_remove") is True,
                 ),
             )
+
+        if normalized == "CPPM_SYNC_NADS":
+            # Hub-orchestrated: one Network Device per tenant subnet carrying the
+            # tenant's RADIUS/TACACS shared secrets (see sync_network_devices).
+            return await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.queries.sync_network_devices(
+                    data.get("tenant_id") or "", data.get("tenant_name") or "",
+                    list(data.get("subnets") or []),
+                    data.get("radius_secret") or "", data.get("tacacs_secret") or ""))
 
         if normalized in ("CPPM_CREATE_LOCAL_USER", "CPPM_SET_LOCAL_USER_PASSWORD",
                           "CPPM_DELETE_LOCAL_USER", "CPPM_GET_LOCAL_USER"):
