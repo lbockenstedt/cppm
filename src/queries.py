@@ -483,14 +483,26 @@ class CPPMQueries:
     def get_all_endpoints(self, page_size: int = 1000) -> Dict[str, Any]:
         """Every endpoint in the device database, paged. One page (200) used to
         hide the rest from LM's Device Database, scans and NetBox matching."""
+        if page_size <= 0:
+            return {"status": "ERROR", "message": "page_size must be positive"}
         devices: List[Dict[str, Any]] = []
+        last_total = 0
         while True:
             page = self.get_device_database(limit=page_size, offset=len(devices))
             if page.get("status") == "ERROR":
                 return page
-            devices.extend(page["devices"])
-            if len(page["devices"]) < page_size or len(devices) >= page["total"]:
-                return {"status": "SUCCESS", "devices": devices, "total": len(devices)}
+            rows = page["devices"]
+            devices.extend(rows)
+            last_total = page.get("total", 0) or 0
+            # A short/empty page ends the scan. The server total is only trusted
+            # when it exceeds this page's size (count may be absent, in which
+            # case total falls back to the page length).
+            if len(rows) < page_size:
+                break
+            if last_total > len(rows) and len(devices) >= last_total:
+                break
+        return {"status": "SUCCESS", "devices": devices,
+                "total": max(len(devices), last_total)}
 
     # --- NAC Status Summary ---
 
