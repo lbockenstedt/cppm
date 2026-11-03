@@ -480,6 +480,18 @@ class CPPMQueries:
         total = result.get("count", len(devices)) if isinstance(result, dict) else len(devices)
         return {"status": "SUCCESS", "devices": devices, "total": total}
 
+    def get_all_endpoints(self, page_size: int = 1000) -> Dict[str, Any]:
+        """Every endpoint in the device database, paged. One page (200) used to
+        hide the rest from LM's Device Database, scans and NetBox matching."""
+        devices: List[Dict[str, Any]] = []
+        while True:
+            page = self.get_device_database(limit=page_size, offset=len(devices))
+            if page.get("status") == "ERROR":
+                return page
+            devices.extend(page["devices"])
+            if len(page["devices"]) < page_size or len(devices) >= page["total"]:
+                return {"status": "SUCCESS", "devices": devices, "total": len(devices)}
+
     # --- NAC Status Summary ---
 
     def get_nac_status(self) -> Dict[str, Any]:
