@@ -309,7 +309,8 @@ class CPPMSpoke:
 
         # LIST_ROLES: every role defined in ClearPass.
         if normalized == "LIST_ROLES":
-            roles = await asyncio.get_event_loop().run_in_executor(None, self.queries.list_roles)
+            roles = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.queries.list_roles(data.get("prefix", "")))
             return {"status": "SUCCESS", "roles": roles}
 
         # SEARCH_SESSIONS: global substring search, tenant-scoped.
