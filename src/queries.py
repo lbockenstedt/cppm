@@ -333,6 +333,11 @@ class CPPMQueries:
     # the CSA's slug.
     TENANT_ATTR_TENANT = "Tenant"
     TENANT_ATTR_TENANT_SLUG = "Tenant_Slug"
+    # Per-device role override (a ClearPass role name, e.g. SSPLM-DMZ) set in
+    # LM and stored on the endpoint; a role-mapping rule turns it into the role.
+    ROLE_ATTR = "LM_Role"
+    # Set once LM_Role has been confirmed/created in the Endpoint dictionary.
+    _role_attr_ready = False
 
     # Upper bound on how many endpoints the substring search scans. ClearPass's
     # REST `filter` only supports exact-equality (no SQL-LIKE), so partial match
@@ -1062,6 +1067,8 @@ class CPPMQueries:
         """
         # Hostname from the source record, and the tenant tags written on every endpoint.
         hostname = (rec.get("hostname", "") or "").strip()
+        role_managed = "nac_role" in rec
+        role = str(rec.get("nac_role") or "").strip()
         tag_attrs = {
             self.TENANT_ATTR_SLUG: tenant_slug,
             self.TENANT_ATTR_NAME: tenant_name,
@@ -1104,7 +1111,14 @@ class CPPMQueries:
                 return "error"
             # Merge tenant tags over the current attributes and make every value a string.
             cur_attrs = dict(existing.get("attributes") or {})
+            old_role = str(cur_attrs.get(self.ROLE_ATTR) or "")
             cur_attrs.update(tag_attrs)
+            # Only a hub that sends "nac_role" manages the override; an empty value clears it.
+            if role_managed:
+                if role:
+                    cur_attrs[self.ROLE_ATTR] = role
+                else:
+                    cur_attrs.pop(self.ROLE_ATTR, None)
             cur_attrs = self._coerce_attrs(cur_attrs)
             # Base PUT body: id, merged attributes and the sync description.
             body: Dict[str, Any] = {"id": ep_id, "attributes": cur_attrs, "description": description}
@@ -1140,6 +1154,9 @@ class CPPMQueries:
                                _nv[:80], len(str(_nv)), mac or "",
                                body.get("status", ""))
                 return "error"
+            # Role changed: bounce the session so the switch re-applies policy.
+            if role_managed and role != old_role and mac:
+                self.bounce_session(mac)
             # Update succeeded.
             return "pushed"
 
@@ -1156,6 +1173,8 @@ class CPPMQueries:
             return "skipped"
 
         # New endpoint: create it keyed on MAC, named by MAC and marked Known.
+        if role_managed and role:
+            tag_attrs[self.ROLE_ATTR] = role
         body = {"mac_address": mac, "name": mac, "description": description,
                 "attributes": self._coerce_attrs(tag_attrs), "status": "Known"}
         # Send the create; a failure is logged and counted as an error.
@@ -1163,8 +1182,44 @@ class CPPMQueries:
         if isinstance(res, dict) and res.get("status") == "ERROR":
             logger.warning("endpoint POST %s failed: %s", mac, res.get("message"))
             return "error"
+        # A role on a brand-new endpoint also needs any live session bounced.
+        if role_managed and role:
+            self.bounce_session(mac)
         # Create succeeded.
         return "pushed"
+
+    def bounce_session(self, mac: str) -> bool:
+        """Disconnect the MAC's active session(s) so the client re-authenticates.
+
+        A RADIUS Disconnect works on any NAS vendor; the client re-auths and
+        picks up the new role. No active session is not an error.
+        """
+        mac_hex = re.sub(r"[^0-9a-f]", "", (mac or "").lower())
+        if len(mac_hex) != 12:
+            return False
+        res = self.client._request(
+            "POST", f"/api/session-action/disconnect/mac/{mac_hex}",
+            params={"async": "true"}, json={})
+        if isinstance(res, dict) and res.get("status") == "ERROR":
+            logger.warning("role change: session bounce for %s failed: %s",
+                           mac, res.get("message"))
+            return False
+        logger.info("role change: bounced session(s) for %s", mac)
+        return True
+
+    def ensure_role_attribute(self) -> bool:
+        """Define LM_Role in the ClearPass Endpoint dictionary so policy rules can use it."""
+        found = self.client.query(f"/api/attribute/Endpoint/name/{self.ROLE_ATTR}")
+        if isinstance(found, dict) and found.get("status") != "ERROR":
+            return True
+        res = self.client._request("POST", "/api/attribute", json={
+            "name": self.ROLE_ATTR, "entity_name": "Endpoint", "data_type": "String",
+            "mandatory": False, "allow_multiple": False})
+        if isinstance(res, dict) and res.get("status") == "ERROR":
+            logger.warning("could not create Endpoint attribute %s: %s",
+                           self.ROLE_ATTR, res.get("message"))
+            return False
+        return True
 
     def _remove_absent_tagged(self, tenant_slug: str, batch_keys: set,
                               allow_mass_remove: bool = False) -> int:
@@ -1404,6 +1459,12 @@ class CPPMQueries:
         pushed = errors = skipped = 0
         err_msgs: List[str] = []
         skipped_details: List[Dict[str, Any]] = []
+        # First sync carrying a role override: make sure LM_Role is in the dictionary.
+        if not self._role_attr_ready and any(str(r.get("nac_role") or "").strip() for _, _, _, r in batch):
+            try:
+                self._role_attr_ready = self.ensure_role_attribute()
+            except Exception as e:
+                logger.warning("ensure %s attribute failed: %s", self.ROLE_ATTR, e)
         # Upsert every batch record; one failure must not stop the rest.
         for key, mac, ip, rec in batch:
             try:
@@ -1842,11 +1903,24 @@ class CPPMQueries:
         # Return the de-duplicated results and their count.
         return {"status": "SUCCESS", "results": unique, "count": len(unique)}
 
-    def list_roles(self) -> List[Dict[str, Any]]:
-        """Fetch all configured user and device roles defined in ClearPass."""
-        # Fetch every role and return the raw records.
-        result = self.client.query("/api/role")
-        return self._items(result)
+    def list_roles(self, prefix: str = "") -> List[Dict[str, Any]]:
+        """Fetch every ClearPass role, optionally only names starting with ``prefix``.
+
+        Pages through /api/role (ClearPass returns a small page by default).
+        """
+        roles: List[Dict[str, Any]] = []
+        offset = 0
+        page = 1000
+        while True:
+            items = self._items(self.client.query(
+                "/api/role", params={"limit": page, "offset": offset}))
+            roles.extend(items)
+            if len(items) < page or offset >= 50000:
+                break
+            offset += page
+        if prefix:
+            roles = [r for r in roles if str(r.get("name") or "").startswith(prefix)]
+        return roles
 
     def get_system_health(self) -> Dict[str, Any]:
         """Query ClearPass server version and health status."""

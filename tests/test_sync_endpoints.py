@@ -474,3 +474,47 @@ def test_sync_endpoints_allow_mass_remove_still_refuses_empty_batch(queries, moc
 
     assert result["removed"] == 0
     assert not [c for c in mock_client._request.call_args_list if c.args[0] == "DELETE"]
+
+
+def _upsert_existing(queries, mock_client, cur_attrs, rec):
+    existing = {"id": 7, "mac_address": "aa:bb:cc:dd:ee:ff", "name": "ws",
+                "status": "Known", "attributes": cur_attrs}
+    mock_client._request.return_value = {"status": "SUCCESS"}
+    queries._upsert_endpoint("aa:bb:cc:dd:ee:ff", "10.0.0.9", rec, "lrb", "lrb", "LRB",
+                             "NetBox", mac_map={"aa:bb:cc:dd:ee:ff": existing})
+    return [c for c in mock_client._request.call_args_list]
+
+
+def test_role_change_writes_lm_role_and_bounces_session(queries, mock_client):
+    calls = _upsert_existing(queries, mock_client, {"LM_Role": "SSPLM-OLD"},
+                             {"nac_role": "SSPLM-DMZ"})
+    put, bounce = calls
+    assert put.kwargs["json"]["attributes"]["LM_Role"] == "SSPLM-DMZ"
+    assert bounce.args == ("POST", "/api/session-action/disconnect/mac/aabbccddeeff")
+
+
+def test_role_cleared_removes_attr_and_bounces(queries, mock_client):
+    calls = _upsert_existing(queries, mock_client, {"LM_Role": "SSPLM-DMZ"}, {"nac_role": ""})
+    assert "LM_Role" not in calls[0].kwargs["json"]["attributes"]
+    assert len(calls) == 2
+
+
+def test_role_unchanged_does_not_bounce(queries, mock_client):
+    calls = _upsert_existing(queries, mock_client, {"LM_Role": "SSPLM-DMZ"},
+                             {"nac_role": "SSPLM-DMZ"})
+    assert len(calls) == 1
+
+
+def test_role_untouched_when_hub_does_not_send_it(queries, mock_client):
+    # An older hub omits nac_role: keep whatever ClearPass has, no bounce.
+    calls = _upsert_existing(queries, mock_client, {"LM_Role": "SSPLM-DMZ"}, {})
+    assert calls[0].kwargs["json"]["attributes"]["LM_Role"] == "SSPLM-DMZ"
+    assert len(calls) == 1
+
+
+def test_list_roles_pages_and_filters_prefix(queries, mock_client):
+    page1 = [{"name": f"r{i}"} for i in range(999)] + [{"name": "SSPLM-DMZ"}]
+    mock_client.query.side_effect = [_hal(page1), _hal([{"name": "SSPLM-ROUTED"}])]
+    roles = queries.list_roles("SSPLM-")
+    assert [r["name"] for r in roles] == ["SSPLM-DMZ", "SSPLM-ROUTED"]
+    assert mock_client.query.call_args.kwargs["params"]["offset"] == 1000
