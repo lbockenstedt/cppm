@@ -1,7 +1,15 @@
+"""Small manual smoke test for the CPPM client and query helpers.
+
+Runs a few example queries against the configured ClearPass server and prints
+the results; useful for checking credentials and connectivity by hand.
+"""
+# REST client (also loads .env on import) and the query helper built on top of it.
 from src.client import CPPMClient
 from src.queries import CPPMQueries
+# os is imported for parity with the other entry scripts; not used directly here.
 import os
 def main():
+    """Run a handful of example ClearPass queries and print what they return."""
     # .env is loaded via CPPMClient import
 
     try:
@@ -33,8 +41,10 @@ def main():
         sessions = queries.get_user_sessions(test_user)
         print(f"Found {len(sessions)} sessions.")
 
+    # Any failure (bad credentials, unreachable host) is printed rather than raised.
     except Exception as e:
         print(f"Error: {e}")
 
 if __name__ == "__main__":
+    # Only run the examples when executed as a script, not when imported.
     main()
