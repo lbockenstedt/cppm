@@ -36,7 +36,7 @@ def test_sync_endpoints_creates_new_endpoint(queries, mock_client):
     mock_client._request.return_value = {"id": 123, "mac_address": "aa:bb:cc:dd:ee:ff"}
 
     result = queries.sync_endpoints(
-        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        tenant_id="lrb", tenant_name="LRB",
         source="NetBox", replace=True,
         endpoints=[{"ip": "172.16.1.62", "mac": "AA-BB-CC-DD-EE-FF", "hostname": "ws-01"}],
     )
@@ -55,11 +55,11 @@ def test_sync_endpoints_creates_new_endpoint(queries, mock_client):
     # ClearPass requires `name` on the endpoint body (a PUT/POST omitting it
     # 422s with validation_messages:["name"]). POST names the endpoint by MAC.
     assert body["name"] == "aa:bb:cc:dd:ee:ff"
-    assert body["attributes"]["NetBox_Tenant_Slug"] == "lrb"
     assert body["attributes"]["NetBox_Tenant_Name"] == "LRB"
     assert body["attributes"]["NetBox_Tenant_ID"] == "lrb"
     assert body["attributes"]["Tenant"] == "LRB"
-    assert body["attributes"]["Tenant_Slug"] == "lrb"
+    assert "NetBox_Tenant_Slug" not in body["attributes"]
+    assert "Tenant_Slug" not in body["attributes"]
     assert body["attributes"]["IP Address"] == "172.16.1.62"
     assert body["attributes"]["Hostname"] == "ws-01"
 
@@ -69,14 +69,14 @@ def test_sync_endpoints_replace_deletes_absent_tagged(queries, mock_client):
     # Existing tagged endpoints: one is in the incoming batch, one is not.
     mock_client.query.return_value = _hal([
         {"id": 55, "mac_address": "11:22:33:44:55:66",
-         "attributes": {"NetBox_Tenant_Slug": "lrb"}},
+         "attributes": {"NetBox_Tenant_ID": "lrb"}},
         {"id": 56, "mac_address": "aa:bb:cc:dd:ee:ff",
-         "attributes": {"NetBox_Tenant_Slug": "lrb"}},
+         "attributes": {"NetBox_Tenant_ID": "lrb"}},
     ], 2)
     mock_client._request.return_value = {"status": "SUCCESS"}
 
     result = queries.sync_endpoints(
-        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        tenant_id="lrb", tenant_name="LRB",
         source="NetBox", replace=True,
         endpoints=[{"ip": "172.16.1.62", "mac": "AA-BB-CC-DD-EE-FF", "hostname": "ws-01"}],
     )
@@ -99,12 +99,12 @@ def test_sync_endpoints_replace_refuses_to_delete_on_empty_batch(queries, mock_c
     """
     mock_client.query.return_value = _hal([
         {"id": 55, "mac_address": "11:22:33:44:55:66",
-         "attributes": {"NetBox_Tenant_Slug": "lrb"}}
+         "attributes": {"NetBox_Tenant_ID": "lrb"}}
     ], 1)
     mock_client._request.return_value = {"status": "SUCCESS"}
 
     result = queries.sync_endpoints(
-        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        tenant_id="lrb", tenant_name="LRB",
         source="NetBox", replace=True, endpoints=[],
     )
 
@@ -122,7 +122,7 @@ def test_sync_endpoints_replace_aborts_runaway_removal(queries, mock_client):
     """
     tagged = [
         {"id": 60 + i, "mac_address": f"11:22:33:44:55:{i:02x}",
-         "attributes": {"NetBox_Tenant_Slug": "lrb"}}
+         "attributes": {"NetBox_Tenant_ID": "lrb"}}
         for i in range(10)
     ]
     mock_client.query.return_value = _hal(tagged, len(tagged))
@@ -130,7 +130,7 @@ def test_sync_endpoints_replace_aborts_runaway_removal(queries, mock_client):
 
     # Batch carries only one of the ten tagged endpoints → 9/10 would be removed.
     result = queries.sync_endpoints(
-        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        tenant_id="lrb", tenant_name="LRB",
         source="NetBox", replace=True,
         endpoints=[{"ip": "172.16.1.62", "mac": "11:22:33:44:55:00", "hostname": "ws-00"}],
     )
@@ -146,7 +146,7 @@ def test_sync_endpoints_ip_only_no_existing_is_skipped(queries, mock_client):
     mock_client.query.return_value = _hal([], 0)
 
     result = queries.sync_endpoints(
-        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        tenant_id="lrb", tenant_name="LRB",
         source="NetBox", replace=False,
         endpoints=[{"ip": "10.0.0.5", "mac": "", "hostname": ""}],
     )
@@ -160,15 +160,17 @@ def test_sync_endpoints_ip_only_no_existing_is_skipped(queries, mock_client):
 
 def test_sync_endpoints_updates_existing_merging_attrs(queries, mock_client):
     # Existing endpoint found by MAC (with a profiler attribute that must be
-    # preserved) → PUT-merge, not POST.
+    # preserved, and slug attributes from older syncs that must be removed)
+    # → PUT-merge, not POST.
     mock_client.query.return_value = _hal([
         {"id": 77, "mac_address": "aa:bb:cc:dd:ee:ff",
-         "attributes": {"Device Vendor": "Apple"}}
+         "attributes": {"Device Vendor": "Apple", "NetBox_Tenant_Slug": "lrb",
+                        "Tenant_Slug": "lrb"}}
     ], 1)
     mock_client._request.return_value = {"id": 77}
 
     result = queries.sync_endpoints(
-        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        tenant_id="lrb", tenant_name="LRB",
         source="NetBox", replace=False,
         endpoints=[{"ip": "10.0.0.9", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws-09"}],
     )
@@ -181,9 +183,10 @@ def test_sync_endpoints_updates_existing_merging_attrs(queries, mock_client):
     body = mock_client._request.call_args.kwargs["json"]
     # Profiler attribute preserved + tenant tag added.
     assert body["attributes"]["Device Vendor"] == "Apple"
-    assert body["attributes"]["NetBox_Tenant_Slug"] == "lrb"
+    assert body["attributes"]["NetBox_Tenant_ID"] == "lrb"
     assert body["attributes"]["Tenant"] == "LRB"
-    assert body["attributes"]["Tenant_Slug"] == "lrb"
+    assert "NetBox_Tenant_Slug" not in body["attributes"]
+    assert "Tenant_Slug" not in body["attributes"]
     assert body["attributes"]["Hostname"] == "ws-09"
     # ClearPass requires `name` on PUT too — preserved from the existing
     # endpoint, falling back to mac when it has none.
@@ -212,7 +215,7 @@ def test_sync_endpoints_ip_only_resolved_via_attribute_ip_map(queries, mock_clie
     mock_client._request.return_value = {"id": 90}
 
     result = queries.sync_endpoints(
-        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        tenant_id="lrb", tenant_name="LRB",
         source="NetBox", replace=False,
         endpoints=[{"ip": "172.16.1.62", "mac": "", "hostname": "ws-62"}],
     )
@@ -226,7 +229,7 @@ def test_sync_endpoints_ip_only_resolved_via_attribute_ip_map(queries, mock_clie
     body = mock_client._request.call_args.kwargs["json"]
     # Existing profiler attribute preserved + tenant tags + IP/hostname added.
     assert body["attributes"]["Device Vendor"] == "Apple"
-    assert body["attributes"]["NetBox_Tenant_Slug"] == "lrb"
+    assert body["attributes"]["NetBox_Tenant_ID"] == "lrb"
     assert body["attributes"]["IP Address"] == "172.16.1.62"
     assert body["attributes"]["Hostname"] == "ws-62"
 
@@ -249,7 +252,7 @@ def test_sync_endpoints_ip_only_resolved_via_unexpected_attr_name(queries, mock_
     mock_client._request.return_value = {"id": 91}
 
     result = queries.sync_endpoints(
-        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        tenant_id="lrb", tenant_name="LRB",
         source="NetBox", replace=False,
         endpoints=[{"ip": "10.9.9.9", "mac": "", "hostname": "ws-99"}],
     )
@@ -261,7 +264,7 @@ def test_sync_endpoints_ip_only_resolved_via_unexpected_attr_name(queries, mock_
     assert method == "PUT"
     assert path == "/api/endpoint/91"
     body = mock_client._request.call_args.kwargs["json"]
-    assert body["attributes"]["NetBox_Tenant_Slug"] == "lrb"
+    assert body["attributes"]["NetBox_Tenant_ID"] == "lrb"
     assert body["attributes"]["IP Address"] == "10.9.9.9"
 
 
@@ -284,7 +287,7 @@ def test_sync_endpoints_ip_only_borrows_mac_from_session_then_creates(queries, m
     mock_client._request.return_value = {"id": 555}
 
     result = queries.sync_endpoints(
-        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        tenant_id="lrb", tenant_name="LRB",
         source="NetBox", replace=False,
         endpoints=[{"ip": "10.9.9.9", "mac": "", "hostname": "ws-99"}],
     )
@@ -299,7 +302,7 @@ def test_sync_endpoints_ip_only_borrows_mac_from_session_then_creates(queries, m
     # Borrowed MAC normalized to colon form; tenant tags + IP/hostname written.
     assert body["mac_address"] == "aa:bb:cc:dd:ee:ff"
     assert body["status"] == "Known"
-    assert body["attributes"]["NetBox_Tenant_Slug"] == "lrb"
+    assert body["attributes"]["NetBox_Tenant_ID"] == "lrb"
     assert body["attributes"]["IP Address"] == "10.9.9.9"
     assert body["attributes"]["Hostname"] == "ws-99"
 
@@ -323,7 +326,7 @@ def test_sync_endpoints_borrowed_mac_merges_existing_no_duplicate(queries, mock_
     mock_client._request.return_value = {"id": 77}
 
     result = queries.sync_endpoints(
-        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        tenant_id="lrb", tenant_name="LRB",
         source="NetBox", replace=False,
         endpoints=[{"ip": "10.9.9.9", "mac": "", "hostname": "ws-99"}],
     )
@@ -335,7 +338,7 @@ def test_sync_endpoints_borrowed_mac_merges_existing_no_duplicate(queries, mock_
     assert path == "/api/endpoint/77"
     body = mock_client._request.call_args.kwargs["json"]
     assert body["attributes"]["Device Vendor"] == "Apple"  # preserved
-    assert body["attributes"]["NetBox_Tenant_Slug"] == "lrb"
+    assert body["attributes"]["NetBox_Tenant_ID"] == "lrb"
     assert body["attributes"]["IP Address"] == "10.9.9.9"
 
 
@@ -356,7 +359,7 @@ def test_sync_endpoints_coerces_nonstring_attr_on_put(queries, mock_client):
     mock_client._request.return_value = {"id": 3018}
 
     result = queries.sync_endpoints(
-        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        tenant_id="lrb", tenant_name="LRB",
         source="NetBox", replace=False,
         endpoints=[{"ip": "172.16.1.62", "mac": "AA-BB-CC-DD-EE-FF", "hostname": "ws-62"}],
     )
@@ -369,13 +372,13 @@ def test_sync_endpoints_coerces_nonstring_attr_on_put(queries, mock_client):
     assert attrs["Some Int"] == "5"
     assert "Dropped" not in attrs
     assert attrs["Device Vendor"] == "Apple"
-    assert attrs["NetBox_Tenant_Slug"] == "lrb"
+    assert attrs["NetBox_Tenant_ID"] == "lrb"
 
 
 def test_sync_endpoints_drops_records_with_neither_mac_nor_ip(queries, mock_client):
     mock_client.query.return_value = _hal([], 0)
     result = queries.sync_endpoints(
-        "lrb", "lrb", "LRB", "NetBox", replace=False,
+        "lrb", "LRB", "NetBox", replace=False,
         endpoints=[{"ip": "", "mac": "", "hostname": "x"}],
     )
     assert result["pushed"] == 0
@@ -395,7 +398,7 @@ def test_upsert_uses_mac_map_and_skips_per_record_get(queries, mock_client):
 
     outcome = queries._upsert_endpoint(
         "aa:bb:cc:dd:ee:ff", "10.0.0.9", {"hostname": "ws-01"},
-        "lrb", "lrb", "LRB", "NetBox", ip_map=None, mac_map=mac_map)
+        "lrb", "LRB", "NetBox", ip_map=None, mac_map=mac_map)
 
     assert outcome == "pushed"
     # No per-record GET: mock_client.query (used by get_device_by_mac) untouched.
@@ -415,7 +418,7 @@ def test_upsert_put_name_strips_whitespace_and_falls_through(queries, mock_clien
 
     queries._upsert_endpoint(
         "aa:bb:cc:dd:ee:ff", "10.0.0.9", {"hostname": ""},
-        "lrb", "lrb", "LRB", "NetBox", ip_map=None, mac_map=None)
+        "lrb", "LRB", "NetBox", ip_map=None, mac_map=None)
 
     body = mock_client._request.call_args.kwargs["json"]
     assert body["name"] == "aa:bb:cc:dd:ee:ff"
@@ -431,7 +434,7 @@ def test_upsert_put_name_truncated_to_255(queries, mock_client):
 
     queries._upsert_endpoint(
         "aa:bb:cc:dd:ee:ff", "10.0.0.9", {"hostname": ""},
-        "lrb", "lrb", "LRB", "NetBox", ip_map=None, mac_map=None)
+        "lrb", "LRB", "NetBox", ip_map=None, mac_map=None)
 
     body = mock_client._request.call_args.kwargs["json"]
     assert len(body["name"]) == 255
@@ -443,14 +446,14 @@ def test_sync_endpoints_allow_mass_remove_bypasses_runaway_guard(queries, mock_c
     endpoints even past the 50% guard."""
     tagged = [
         {"id": 60 + i, "mac_address": f"11:22:33:44:55:{i:02x}",
-         "attributes": {"NetBox_Tenant_Slug": "lrb"}}
+         "attributes": {"NetBox_Tenant_ID": "lrb"}}
         for i in range(10)
     ]
     mock_client.query.return_value = _hal(tagged, len(tagged))
     mock_client._request.return_value = {"status": "SUCCESS"}
 
     result = queries.sync_endpoints(
-        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        tenant_id="lrb", tenant_name="LRB",
         source="NetBox", replace=True, allow_mass_remove=True,
         endpoints=[{"ip": "172.16.1.62", "mac": "11:22:33:44:55:00", "hostname": "ws-00"}],
     )
@@ -463,12 +466,12 @@ def test_sync_endpoints_allow_mass_remove_bypasses_runaway_guard(queries, mock_c
 def test_sync_endpoints_allow_mass_remove_still_refuses_empty_batch(queries, mock_client):
     """Guard 1 (empty batch) is never bypassed."""
     tagged = [{"id": 1, "mac_address": "11:22:33:44:55:01",
-               "attributes": {"NetBox_Tenant_Slug": "lrb"}}]
+               "attributes": {"NetBox_Tenant_ID": "lrb"}}]
     mock_client.query.return_value = _hal(tagged, 1)
     mock_client._request.return_value = {"status": "SUCCESS"}
 
     result = queries.sync_endpoints(
-        tenant_id="lrb", tenant_slug="lrb", tenant_name="LRB",
+        tenant_id="lrb", tenant_name="LRB",
         source="NetBox", replace=True, allow_mass_remove=True, endpoints=[],
     )
 
@@ -480,7 +483,7 @@ def _upsert_existing(queries, mock_client, cur_attrs, rec):
     existing = {"id": 7, "mac_address": "aa:bb:cc:dd:ee:ff", "name": "ws",
                 "status": "Known", "attributes": cur_attrs}
     mock_client._request.return_value = {"status": "SUCCESS"}
-    queries._upsert_endpoint("aa:bb:cc:dd:ee:ff", "10.0.0.9", rec, "lrb", "lrb", "LRB",
+    queries._upsert_endpoint("aa:bb:cc:dd:ee:ff", "10.0.0.9", rec, "lrb", "LRB",
                              "NetBox", mac_map={"aa:bb:cc:dd:ee:ff": existing})
     return [c for c in mock_client._request.call_args_list]
 
