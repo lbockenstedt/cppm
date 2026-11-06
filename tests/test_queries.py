@@ -91,7 +91,7 @@ def test_upsert_endpoint_put_preserves_existing_status(queries, mock_client):
     mock_client._request.return_value = {"status": "SUCCESS"}
 
     res = queries._upsert_endpoint("aa:bb:cc:dd:ee:ff", "10.0.0.5",
-                                   {"hostname": "ws"}, "t1", "lrb", "LRB", "NetBox")
+                                   {"hostname": "ws"}, "t1", "LRB", "NetBox")
 
     assert res == "pushed"
     call = mock_client._request.call_args
@@ -110,7 +110,7 @@ def test_upsert_endpoint_put_defaults_status_known_when_missing(queries, mock_cl
     mock_client._request.return_value = {"status": "SUCCESS"}
 
     res = queries._upsert_endpoint("aa:bb:cc:dd:ee:ff", "10.0.0.5",
-                                   {"hostname": "ws"}, "t1", "lrb", "LRB", "NetBox")
+                                   {"hostname": "ws"}, "t1", "LRB", "NetBox")
 
     assert res == "pushed"
     body = mock_client._request.call_args.kwargs["json"]

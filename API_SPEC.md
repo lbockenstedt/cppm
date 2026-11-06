@@ -38,18 +38,19 @@ The CPPM Spoke integrates Lab Manager with Aruba ClearPass Policy Manager (CPPM)
     endpoint batch (pulled from the configured IPAM source, e.g. NetBox) into
     ClearPass Device Inventory, tagged with the tenant so an Enforcement Policy
     can match the tenant the same way the at-auth-time Context Server Action
-    (`NetBox_Tenant_Slug`) does. When `replace: true`, the IPAM source is the
+    (`NetBox_Tenant_Name`) does. When `replace: true`, the IPAM source is the
     source of truth — endpoints previously tagged with this tenant that are
     absent from the batch are deleted. Best-effort: per-endpoint failures are
     counted, never raised.
-  - **Payload**: `{"tenant_id": "lrb", "tenant_slug": "lrb", "tenant_name": "LRB", "source": "NetBox", "replace": true, "endpoints": [{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws-01"}]}`
+  - **Payload**: `{"tenant_id": "lrb", "tenant_name": "LRB", "source": "NetBox", "replace": true, "endpoints": [{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws-01"}]}`
   - **Upsert key**: MAC (normalized to `aa:bb:cc:dd:ee:ff`), falling back to IP
     lookup when MAC is empty. Existing endpoints are PUT-merged (profiler
-    attributes preserved) + tagged with `NetBox_Tenant_Slug`/`_Name`/`_ID` and
-    the human-readable `Tenant` (name) / `Tenant_Slug` (slug), plus `IP Address`,
-    `Hostname`, and `status: Known`; new ones are POSTed. The `Tenant`/
-    `Tenant_Slug` values are pulled from NetBox via the hub payload
-    (`tenant_name` / `tenant_slug`). IP-only records with no existing endpoint
+    attributes preserved) + tagged with `NetBox_Tenant_Name`/`_ID` and
+    the human-readable `Tenant` (name), plus `IP Address`, `Hostname`, and
+    `status: Known`; new ones are POSTed. Tenant ownership (for `replace` and
+    search scoping) is `NetBox_Tenant_ID` = the LM `tenant_id`. Slug attributes
+    left by older versions (`NetBox_Tenant_Slug`, `Tenant_Slug`) are removed on
+    the next PUT. IP-only records with no existing endpoint
     are skipped (ClearPass endpoints are MAC-keyed). Records with neither MAC
     nor IP are dropped by the hub.
   - **Response**: `{"status": "SUCCESS"|"ERROR", "pushed": <int>, "errors": <int>, "skipped": <int>, "removed": <int>, "message": "..."}`
@@ -57,11 +58,11 @@ The CPPM Spoke integrates Lab Manager with Aruba ClearPass Policy Manager (CPPM)
 ### Local Users (JIT 802.1X)
 Used by the hub's `dot1x_jit` broker to create Policy Manager local users for
 simulated 802.1X clients. Every user it creates carries the attribute
-`LM_Managed: dot1x_jit` (plus `Tenant_Slug`); create refuses to take over an
+`LM_Managed: dot1x_jit`; create refuses to take over an
 existing local user without that marker.
 - **`CPPM_SYNC_NADS`** — `{"tenant_id": "dxp", "tenant_name": "DXP", "subnets": ["10.0.0.0/8"], "radius_secret": "...", "tacacs_secret": "..."}` →
   `{"status": "SUCCESS"|"PARTIAL"|"ERROR", "created", "updated", "removed", "errors", "error_details"}`. One Network Device per subnet (`LM-<tenant>-<subnet>`, vendor Aruba, description `LM-managed tenant=<tenant>; …`); the tenant's LM-managed devices whose subnet is gone are deleted. Devices without the marker are never touched. At least one secret is required.
-- **`CPPM_CREATE_LOCAL_USER`** — `{"user_id": "jsmith", "password": "...", "role_name": "[Employee]", "tenant_slug": "lrb"}` →
+- **`CPPM_CREATE_LOCAL_USER`** — `{"user_id": "jsmith", "password": "...", "role_name": "[Employee]"}` →
   `{"status", "user_id", "created": bool}`. An existing LM-managed user is re-keyed (PATCH); a non-managed one returns `ERROR` with `code: 409`.
 - **`CPPM_SET_LOCAL_USER_PASSWORD`** — `{"user_id", "password"}` → `{"status", "user_id"}`.
 - **`CPPM_DELETE_LOCAL_USER`** — `{"user_id"}` → `{"status", "user_id", "deleted": bool}` (absent = success, `deleted: false`).
