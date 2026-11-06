@@ -318,7 +318,7 @@ class CPPMSpoke:
             return await asyncio.get_event_loop().run_in_executor(
                 None, lambda: self.queries.search(
                     data.get("q", ""),
-                    tenant=data.get("tenant", ""),
+                    tenant_id=data.get("tenant_id", ""),
                     is_admin=bool(data.get("is_admin", False)),
                 )
             )
@@ -334,7 +334,6 @@ class CPPMSpoke:
                 None,
                 lambda: self.queries.sync_endpoints(
                     tenant_id=data.get("tenant_id", ""),
-                    tenant_slug=data.get("tenant_slug", ""),
                     tenant_name=data.get("tenant_name", ""),
                     source=data.get("source", ""),
                     endpoints=data.get("endpoints", []) or [],
@@ -364,7 +363,6 @@ class CPPMSpoke:
                 fn = lambda: self.queries.create_local_user(
                     uid, data.get("password") or "",
                     role_name=data.get("role_name") or "[Employee]",
-                    tenant_slug=data.get("tenant_slug") or "",
                     attributes=data.get("attributes") or None)
             elif normalized == "CPPM_SET_LOCAL_USER_PASSWORD":
                 fn = lambda: self.queries.set_local_user_password(uid, data.get("password") or "")
