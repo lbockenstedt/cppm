@@ -27,14 +27,14 @@ def _not_found():
 
 def test_create_posts_new_user_with_marker(queries, mock_client):
     mock_client._request.side_effect = [_not_found(), {"id": 7}]
-    res = queries.create_local_user("jsmith", "pw1", role_name="[Employee]", tenant_slug="lrb")
+    res = queries.create_local_user("jsmith", "pw1", role_name="[Employee]")
     assert res == {"status": "SUCCESS", "user_id": "jsmith", "created": True}
     method, path = mock_client._request.call_args_list[1].args
     body = mock_client._request.call_args_list[1].kwargs["json"]
     assert (method, path) == ("POST", "/api/local-user")
     assert body["user_id"] == "jsmith" and body["password"] == "pw1"
     assert body["attributes"]["LM_Managed"] == "dot1x_jit"
-    assert body["attributes"]["Tenant_Slug"] == "lrb"
+    assert "Tenant_Slug" not in body["attributes"]
 
 
 def test_create_refuses_unmanaged_existing(queries, mock_client):
