@@ -318,21 +318,14 @@ class CPPMQueries:
     """
     High-level interface for querying ClearPass Policy Manager.
     """
-    # Tenant tag stored as endpoint attributes — the SAME names the at-auth-time
-    # Context Server Action (lm/clearpass/netbox-tenant-context-server-action.json)
-    # populates as Authorization attributes, so an Enforcement Policy can match
-    # the tenant whether it was resolved ahead-of-time (this sync, via MAC lookup)
-    # or at auth time (the CSA, via the endpoint's IP).
-    TENANT_ATTR_SLUG = "NetBox_Tenant_Slug"
+    # Tenant tags stored as endpoint attributes. NetBox_Tenant_ID (the LM tenant
+    # id) is the ownership key: the replace-scan and tenant-scoped search match
+    # on it. "Tenant" is the friendly name shown in Device Inventory.
     TENANT_ATTR_NAME = "NetBox_Tenant_Name"
     TENANT_ATTR_ID = "NetBox_Tenant_ID"
-    # Human-readable tenant attributes (value pulled from NetBox via the hub
-    # payload): the friendly name and the machine slug. These sit alongside the
-    # NetBox_Tenant_* tags so ClearPass Device Inventory shows a plain "Tenant"
-    # column and an enforcement policy can match on either a friendly label or
-    # the CSA's slug.
     TENANT_ATTR_TENANT = "Tenant"
-    TENANT_ATTR_TENANT_SLUG = "Tenant_Slug"
+    # Slug attributes older syncs wrote; removed from endpoints/users on update.
+    OLD_SLUG_ATTRS = ("NetBox_Tenant_Slug", "Tenant_Slug")
     # Per-device role override (a ClearPass role name, e.g. SSPLM-DMZ) set in
     # LM and stored on the endpoint; a role-mapping rule turns it into the role.
     ROLE_ATTR = "LM_Role"
@@ -709,7 +702,7 @@ class CPPMQueries:
         return {"status": "SUCCESS", "found": True, "user": user}
 
     def create_local_user(self, user_id: str, password: str,
-                          role_name: str = "[Employee]", tenant_slug: str = "",
+                          role_name: str = "[Employee]",
                           attributes: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Create (or re-key, when already LM-managed) a local user."""
         # Normalise the id; both id and password are mandatory.
@@ -720,11 +713,9 @@ class CPPMQueries:
         existing = self.get_local_user(user_id)
         if existing.get("status") == "ERROR":
             return existing
-        # Stringify caller attributes (dropping empty ones), then add the LM marker and tenant.
+        # Stringify caller attributes (dropping empty ones), then add the LM marker.
         attrs = {k: str(v) for k, v in (attributes or {}).items() if v not in (None, "")}
         attrs[self.LOCAL_USER_MARKER] = self.LOCAL_USER_MARKER_VALUE
-        if tenant_slug:
-            attrs["Tenant_Slug"] = tenant_slug
         # Existing user: only take it over when it already carries the LM marker.
         if existing.get("found"):
             cur = (existing.get("user") or {}).get("attributes") or {}
@@ -732,9 +723,10 @@ class CPPMQueries:
                 return {"status": "ERROR", "code": 409,
                         "message": f"local user {user_id!r} exists and is not LM-managed"}
             # Re-key the LM-managed user: new password/role, merged attributes, enabled.
+            merged = {k: v for k, v in {**cur, **attrs}.items() if k not in self.OLD_SLUG_ATTRS}
             res = self.client._request("PATCH", self._local_user_path(user_id), json={
                 "password": password, "role_name": role_name, "enabled": True,
-                "attributes": {**cur, **attrs}})
+                "attributes": merged})
             if isinstance(res, dict) and res.get("status") == "ERROR":
                 return res
             return {"status": "SUCCESS", "user_id": user_id, "created": False}
@@ -1043,7 +1035,7 @@ class CPPMQueries:
         return resolved
 
     def _upsert_endpoint(self, mac: str, ip: str, rec: Dict[str, Any],
-                         tenant_id: str, tenant_slug: str, tenant_name: str,
+                         tenant_id: str, tenant_name: str,
                          source: str,
                          ip_map: Optional[Dict[str, Dict[str, Any]]] = None,
                          mac_map: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
@@ -1070,11 +1062,9 @@ class CPPMQueries:
         role_managed = "nac_role" in rec
         role = str(rec.get("nac_role") or "").strip()
         tag_attrs = {
-            self.TENANT_ATTR_SLUG: tenant_slug,
             self.TENANT_ATTR_NAME: tenant_name,
             self.TENANT_ATTR_ID: tenant_id,
             self.TENANT_ATTR_TENANT: tenant_name,
-            self.TENANT_ATTR_TENANT_SLUG: tenant_slug,
         }
         # Add the IP and hostname attributes only when known.
         if ip:
@@ -1082,7 +1072,7 @@ class CPPMQueries:
         if hostname:
             tag_attrs["Hostname"] = hostname
         # Description that records where and for which tenant this endpoint was synced.
-        description = f"Synced from {source} (tenant {tenant_slug})"
+        description = f"Synced from {source} (tenant {tenant_name or tenant_id})"
 
         # Find any existing endpoint for this record.
         existing = None
@@ -1113,6 +1103,8 @@ class CPPMQueries:
             cur_attrs = dict(existing.get("attributes") or {})
             old_role = str(cur_attrs.get(self.ROLE_ATTR) or "")
             cur_attrs.update(tag_attrs)
+            for old in self.OLD_SLUG_ATTRS:
+                cur_attrs.pop(old, None)
             # Only a hub that sends "nac_role" manages the override; an empty value clears it.
             if role_managed:
                 if role:
@@ -1169,7 +1161,7 @@ class CPPMQueries:
                 "endpoints are MAC-keyed so an IP-only record cannot be created. "
                 "(If the device is already in ClearPass, ensure the NetBox IP "
                 "carries its MAC so the sync can merge by MAC.)",
-                tenant_slug, ip or "<empty>", hostname or "<empty>")
+                tenant_id, ip or "<empty>", hostname or "<empty>")
             return "skipped"
 
         # New endpoint: create it keyed on MAC, named by MAC and marked Known.
@@ -1221,7 +1213,7 @@ class CPPMQueries:
             return False
         return True
 
-    def _remove_absent_tagged(self, tenant_slug: str, batch_keys: set,
+    def _remove_absent_tagged(self, tenant_id: str, batch_keys: set,
                               allow_mass_remove: bool = False) -> int:
         """Delete endpoints tagged with this tenant whose key is not in the batch.
 
@@ -1249,7 +1241,7 @@ class CPPMQueries:
         # the whole tagged inventory — refuse.
         if not batch_keys:
             raise ReplaceScanAborted(
-                f"empty batch for tenant '{tenant_slug}' — refusing to remove "
+                f"empty batch for tenant '{tenant_id}' — refusing to remove "
                 "any tagged endpoints (would delete the entire tenant inventory)")
 
         # Pass 1: enumerate this tenant's tagged endpoints and which are absent
@@ -1276,7 +1268,7 @@ class CPPMQueries:
             # Only endpoints tagged with this tenant are candidates for removal.
             for ep in items:
                 attrs = ep.get("attributes") or {}
-                if attrs.get(self.TENANT_ATTR_SLUG) != tenant_slug:
+                if attrs.get(self.TENANT_ATTR_ID) != tenant_id:
                     continue
                 # Count it as tagged and work out its key (MAC, or IP when no MAC).
                 tagged_total += 1
@@ -1304,7 +1296,7 @@ class CPPMQueries:
         if (not allow_mass_remove and tagged_total
                 and len(to_delete) > tagged_total * 0.5):
             raise ReplaceScanAborted(
-                f"replace-scan for tenant '{tenant_slug}' would remove "
+                f"replace-scan for tenant '{tenant_id}' would remove "
                 f"{len(to_delete)} of {tagged_total} tagged endpoints (>50%) — "
                 "likely a truncated/failed batch; refusing to mass-delete")
 
@@ -1320,7 +1312,7 @@ class CPPMQueries:
         # Number of endpoints actually removed.
         return removed
 
-    def sync_endpoints(self, tenant_id: str, tenant_slug: str, tenant_name: str,
+    def sync_endpoints(self, tenant_id: str, tenant_name: str,
                        source: str, endpoints: List[Dict[str, Any]],
                        replace: bool = True,
                        allow_mass_remove: bool = False) -> Dict[str, Any]:
@@ -1342,10 +1334,10 @@ class CPPMQueries:
         Returns {status, pushed, errors, skipped, removed, message}. The hub
         reads status/pushed/errors/message; skipped/removed are extra detail.
         """
-        # A tenant slug is required because it is the tag that scopes the whole sync.
-        tenant_slug = (tenant_slug or "").strip()
-        if not tenant_slug:
-            return {"status": "ERROR", "message": "Missing tenant_slug",
+        # The tenant id is required because it is the tag that scopes the whole sync.
+        tenant_id = (tenant_id or "").strip()
+        if not tenant_id:
+            return {"status": "ERROR", "message": "Missing tenant_id",
                     "pushed": 0, "errors": 0, "skipped": 0, "removed": 0}
         # Default the source label used in endpoint descriptions.
         source = source or "IPAM"
@@ -1380,7 +1372,7 @@ class CPPMQueries:
             except Exception as e:
                 logger.warning("endpoint sync tenant=%s MAC-map build failed: %s "
                                "(falling back to per-record get_device_by_mac)",
-                               tenant_slug, e)
+                               tenant_id, e)
                 mac_map = None
 
         # IP-only records (no MAC on the NetBox side) need an existing
@@ -1402,18 +1394,18 @@ class CPPMQueries:
                                    "carrying any of these IPs, so they will be skipped "
                                    "(no MAC to attach). If the devices are expected in "
                                    "ClearPass, verify the endpoint inventory. IPs: %s",
-                                   tenant_slug, len(ip_only),
+                                   tenant_id, len(ip_only),
                                    ", ".join(sorted(ip_only)[:10]))
                 # Some were resolved: log the coverage.
                 else:
                     logger.info("endpoint sync tenant=%s IP→endpoint map: %d of %d "
                                 "IP-only records resolved from ClearPass",
-                                tenant_slug, resolved_n, len(ip_only))
+                                tenant_id, resolved_n, len(ip_only))
             # Map build failed: log and continue without it.
             except Exception as e:
                 logger.warning("endpoint sync tenant=%s IP-map build failed: %s "
                                "(falling back to exact ip_address filter only)",
-                               tenant_slug, e)
+                               tenant_id, e)
                 ip_map = None
 
         # Fallback MAC source for IP-only records the endpoint inventory did NOT
@@ -1433,12 +1425,12 @@ class CPPMQueries:
                 if sm_n:
                     logger.info("endpoint sync tenant=%s session IP→MAC map: %d of %d "
                                 "unresolved IP-only records borrowed a MAC from "
-                                "ClearPass sessions", tenant_slug, sm_n, len(unresolved))
+                                "ClearPass sessions", tenant_id, sm_n, len(unresolved))
                 else:
                     logger.info("endpoint sync tenant=%s session IP→MAC map: 0 of %d "
                                 "unresolved IP-only records had a session with "
                                 "framedipaddress — no MAC to borrow. IPs: %s",
-                                tenant_slug, len(unresolved),
+                                tenant_id, len(unresolved),
                                 ", ".join(sorted(unresolved)[:10]))
                 # Apply borrowed MACs to the batch in place so each record becomes
                 # MAC-bearing for the upsert AND batch_keys carries the borrowed
@@ -1453,7 +1445,7 @@ class CPPMQueries:
             # Session fallback failed: log and continue without it.
             except Exception as e:
                 logger.warning("endpoint sync tenant=%s session MAC-map build failed: "
-                               "%s (skipping session fallback)", tenant_slug, e)
+                               "%s (skipping session fallback)", tenant_id, e)
 
         # Per-outcome counters, error messages and details of skipped records.
         pushed = errors = skipped = 0
@@ -1468,7 +1460,7 @@ class CPPMQueries:
         # Upsert every batch record; one failure must not stop the rest.
         for key, mac, ip, rec in batch:
             try:
-                outcome = self._upsert_endpoint(mac, ip, rec, tenant_id, tenant_slug,
+                outcome = self._upsert_endpoint(mac, ip, rec, tenant_id,
                                                  tenant_name, source,
                                                  ip_map=ip_map, mac_map=mac_map)
                 # Tally the outcome reported by the upsert.
@@ -1498,7 +1490,7 @@ class CPPMQueries:
         if replace:
             try:
                 removed = self._remove_absent_tagged(
-                    tenant_slug, batch_keys, allow_mass_remove=allow_mass_remove)
+                    tenant_id, batch_keys, allow_mass_remove=allow_mass_remove)
             except ReplaceScanAborted as e:
                 # Deliberate safety abort (empty/runaway batch) — count it as an
                 # error so the sync reports ERROR rather than a silent success
@@ -1506,7 +1498,7 @@ class CPPMQueries:
                 errors += 1
                 err_msgs.append(f"replace-scan aborted: {e}")
                 logger.error("endpoint sync tenant=%s replace-scan aborted: %s",
-                             tenant_slug, e)
+                             tenant_id, e)
             # Other replace-scan failures are reported but do not mark the sync as failed.
             except Exception as e:
                 err_msgs.append(f"replace-scan: {e}")
@@ -1515,7 +1507,7 @@ class CPPMQueries:
         if skipped_details:
             logger.info(
                 "endpoint sync tenant=%s skipped %d record(s): %s",
-                tenant_slug, skipped,
+                tenant_id, skipped,
                 "; ".join(f"ip={s['ip'] or '<empty>'} mac={s['mac'] or '<empty>'} "
                           f"hostname={s['hostname'] or '<empty>'}" for s in skipped_details))
 
@@ -1657,9 +1649,8 @@ class CPPMQueries:
         # Prefer the Hostname attribute (populated by sync / profiler) for the
         # display name; fall back to MAC so the row is never blank.
         name = attrs.get("Hostname") or ep.get("mac_address", "")
-        # Tenant slug stamped by the IPAM→CPPM sync (or the at-auth-time CSA).
-        # Empty when the endpoint has no NetBox tenant tag (e.g. profiler-only).
-        tenant_slug = (attrs.get(self.TENANT_ATTR_SLUG) or "").strip()
+        # Tenant id stamped by the IPAM→CPPM sync; empty when untagged.
+        tenant_id = (attrs.get(self.TENANT_ATTR_ID) or "").strip()
         # Build the normalised search-result row.
         return {
             "source":  "cppm",
@@ -1669,7 +1660,7 @@ class CPPMQueries:
             "mac":     ep.get("mac_address", ""),
             "status":  ep.get("status", ""),
             "vendor":  ep.get("vendor_name", ""),
-            "tenant":  tenant_slug,
+            "tenant":  tenant_id,
             "id":      ep.get("id", ""),
         }
 
@@ -1709,7 +1700,7 @@ class CPPMQueries:
         # Nothing matched.
         return False
 
-    def search(self, query: str, tenant: str = "",
+    def search(self, query: str, tenant_id: str = "",
                is_admin: bool = False) -> Dict[str, Any]:
         """
         Search CPPM endpoints (Device Inventory) and active sessions by
@@ -1722,13 +1713,13 @@ class CPPMQueries:
         of any text field. Returns normalised results tagged source="cppm".
 
         Tenant scoping (enforced spoke-side per the hub payload contract):
-          - `tenant` slug set → only emit results whose NetBox_Tenant_Slug
+          - `tenant_id` set → only emit results whose NetBox_Tenant_ID
             matches. Sessions don't carry a tenant attribute directly, so each
-            session is joined to its endpoint by MAC to resolve the slug; a
+            session is joined to its endpoint by MAC to resolve the tenant; a
             session whose MAC has no endpoint (or a non-matching one) is
             dropped.
-          - `tenant` absent + `is_admin` True → unscoped (all results).
-          - `tenant` absent + `is_admin` False → empty (never leak another
+          - `tenant_id` absent + `is_admin` True → unscoped (all results).
+          - `tenant_id` absent + `is_admin` False → empty (never leak another
             tenant's sessions/endpoints).
 
         Each sub-search (endpoints, sessions) is wrapped in its own try/except
@@ -1739,8 +1730,8 @@ class CPPMQueries:
         if not q:
             return {"status": "SUCCESS", "results": [], "count": 0}
 
-        # Results are tenant-scoped whenever a tenant slug is supplied.
-        scoped = bool(tenant)
+        # Results are tenant-scoped whenever a tenant id is supplied.
+        scoped = bool(tenant_id)
         if not scoped and not is_admin:
             # No scope + non-admin → return nothing rather than risk leaking
             # another tenant's sessions/endpoints.
@@ -1749,14 +1740,14 @@ class CPPMQueries:
         # Collected results and ids already emitted (to avoid duplicates).
         results = []
         seen_ids: set = set()
-        # MAC → NetBox_Tenant_Slug map, populated from the endpoint scan so
+        # MAC → NetBox_Tenant_ID map, populated from the endpoint scan so
         # sessions can be joined to a tenant (sessions carry no tenant attr).
         mac_to_tenant: Dict[str, str] = {}
 
-        def _ep_tenant_slug(ep: Dict[str, Any]) -> str:
-            """Return the NetBox tenant slug tagged on an endpoint, or "" when untagged."""
+        def _ep_tenant(ep: Dict[str, Any]) -> str:
+            """Return the tenant id tagged on an endpoint, or "" when untagged."""
             attrs = ep.get("attributes") or {}
-            return (attrs.get(self.TENANT_ATTR_SLUG) or "").strip()
+            return (attrs.get(self.TENANT_ATTR_ID) or "").strip()
 
         # --- Endpoints (exact + bounded substring scan) ---------------------
         try:
@@ -1766,10 +1757,10 @@ class CPPMQueries:
                 # Record each match's tenant, apply tenant scoping and de-duplicate by id.
                 for ep in self._items(ep_r):
                     mac = self._norm_mac(ep.get("mac_address", ""))
-                    tslug = _ep_tenant_slug(ep)
+                    ep_tenant = _ep_tenant(ep)
                     if mac:
-                        mac_to_tenant[mac] = tslug
-                    if scoped and tslug != tenant:
+                        mac_to_tenant[mac] = ep_tenant
+                    if scoped and ep_tenant != tenant_id:
                         continue
                     if ep.get("id") and ep["id"] not in seen_ids:
                         seen_ids.add(ep["id"])
@@ -1796,13 +1787,13 @@ class CPPMQueries:
                 # Remember each endpoint's tenant (for the session join) before filtering.
                 for ep in items:
                     mac = self._norm_mac(ep.get("mac_address", ""))
-                    tslug = _ep_tenant_slug(ep)
+                    ep_tenant = _ep_tenant(ep)
                     if mac:
-                        mac_to_tenant[mac] = tslug
+                        mac_to_tenant[mac] = ep_tenant
                     # Skip non-matches, other tenants' endpoints and duplicates.
                     if not self._endpoint_matches(ep, q):
                         continue
-                    if scoped and tslug != tenant:
+                    if scoped and ep_tenant != tenant_id:
                         continue
                     if ep.get("id") and ep["id"] in seen_ids:
                         continue
@@ -1865,7 +1856,7 @@ class CPPMQueries:
                     # (sessions carry no tenant attribute of their own).
                     smac = self._norm_mac(s.get("callingstation", ""))
                     stenant = mac_to_tenant.get(smac, "")
-                    if scoped and stenant != tenant:
+                    if scoped and stenant != tenant_id:
                         # No endpoint, or endpoint's tenant doesn't match → drop
                         # for scoped callers (never leak across tenants).
                         continue

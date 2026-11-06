@@ -54,7 +54,7 @@ The `cppm` spoke integrates Aruba ClearPass Policy Manager with Lab Manager's hu
 ## Features
 
 - **Access Tracker Live Session Inspection:** Real-time query of active authentication sessions, authorization status, client IP/MAC mappings, SSID/NAS port details, and RADIUS accounting records.
-- **Endpoint & Device Database Management:** Device inventory scanning, manual and automated endpoint upserting, vendor MAC profiling, and tenant-tag synchronization (`NetBox_Tenant_Slug`, `NetBox_Tenant_Name`, `NetBox_Tenant_ID`).
+- **Endpoint & Device Database Management:** Device inventory scanning, manual and automated endpoint upserting, vendor MAC profiling, and tenant-tag synchronization (`NetBox_Tenant_Name`, `NetBox_Tenant_ID`).
 - **Device Profiling & MAC Queries:** Detailed device lookups by MAC address or IP address with deep fallback scans across vendor attributes.
 - **System Health Monitoring:** Cluster node status, service operational state, RADIUS/TACACS+ process health, and system resource metrics.
 - **Robust OAuth2 Authentication:** Automated authentication negotiation prioritizing user password grants (for full operator privileges) with fallback to client credentials and HTTP basic auth.
