@@ -18,3 +18,7 @@ secrets.json
 certs/
 .env.lock
 *.crt
+
+# Runtime logs
+logs/
+*.log
