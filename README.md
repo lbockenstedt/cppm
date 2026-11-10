@@ -4,6 +4,24 @@ Aruba ClearPass Policy Manager network access control (NAC) spoke for Lab Manage
 
 ---
 
+## Repository layout
+
+| Path | What it holds |
+| :--- | :--- |
+| `.claude/` | Fleet-owned skills, synced from lm; edit them in lm. |
+| `.github/` | CI (`workflows/ci.yml`), the thin `promote`/`backmerge` callers, promotion scripts and fleet-owned agents. |
+| `docs/` | This module's docs (copies of the canonical pages in `lm/docs`). |
+| `src/` | The spoke's Python source (entry point, engine, control plane). |
+| `tests/` | pytest suite; CI runs it in the `test` job. |
+| `.env.example` | Template for the `.env` the installer writes (the real `.env` is never committed). |
+| `AGENTS.md` | Orientation for people and AI agents; the fleet rules block is synced from lm. |
+| `API_SPEC.md` | The commands and routes this spoke exposes. |
+| `conftest.py` | Shared pytest fixtures and import paths. |
+| `install.sh` | Installer (idempotent; safe to re-run). |
+| `README.md` | This file. |
+| `requirements.txt` | Runtime Python dependencies. |
+| `VERSION` | Bot-owned version; promotion bumps it. Never edit by hand. |
+
 ## Architecture & Overview
 
 The `cppm` spoke integrates Aruba ClearPass Policy Manager with Lab Manager's hub-and-spoke infrastructure over an outbound WebSocket connection (port 443).
