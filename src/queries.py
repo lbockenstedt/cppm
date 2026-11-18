@@ -475,6 +475,7 @@ class CPPMQueries:
                 "calculate_count": "true",
                 "limit": limit,
                 "offset": offset,
+                "sort": "-id",
                 "filter": recent_filter,
             },
         )
@@ -484,6 +485,8 @@ class CPPMQueries:
         data = self._normalize_access_tracker(result)
         # Mark the history window so the hub can detect older spokes that ignored it.
         if data.get("status") == "SUCCESS":
+            total = data.get("total")
+            data["has_more"] = (type(total) is int and offset + len(data["sessions"]) < total)
             data["window_start"] = start_iso
             data["lookback_hours"] = hours
         return data

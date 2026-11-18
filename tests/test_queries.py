@@ -126,7 +126,7 @@ def test_get_recent_sessions_filters_by_acctstarttime_and_normalizes(queries, mo
     import json as _json
     import datetime as _dt
     mock_client.query.return_value = {
-        "count": 2,
+        "count": 20,
         "_embedded": {"items": [
             {"id": 1, "username": "alice", "callingstation": "AA:BB:CC:DD:EE:01",
              "framedipaddress": "10.0.0.5", "nasipaddress": "10.0.0.254",
@@ -192,7 +192,7 @@ def test_get_recent_access_tracker_includes_recent_closed_sessions(queries, mock
     import datetime as _dt
 
     mock_client.query.return_value = {
-        "count": 1,
+        "count": 20,
         "_embedded": {"items": [{
             "id": 42, "username": "alice", "callingstation": "AA:BB:CC:DD:EE:01",
             "framedipaddress": "10.0.0.5", "acctstarttime": "2026-07-01 10:00:00",
@@ -203,7 +203,8 @@ def test_get_recent_access_tracker_includes_recent_closed_sessions(queries, mock
     res = queries.get_recent_access_tracker(limit=50, offset=10, lookback_hours=24)
 
     assert res["status"] == "SUCCESS"
-    assert res["total"] == 1
+    assert res["total"] == 20
+    assert res["has_more"] is True
     assert res["sessions"][0]["id"] == 42
     assert res["sessions"][0]["username"] == "alice"
     assert res["sessions"][0]["start_time"] == "2026-07-01T10:00:00"
@@ -211,6 +212,7 @@ def test_get_recent_access_tracker_includes_recent_closed_sessions(queries, mock
     params = mock_client.query.call_args.kwargs["params"]
     assert params["limit"] == 50
     assert params["offset"] == 10
+    assert params["sort"] == "-id"
     filt = json.loads(params["filter"])
     assert "acctstoptime" not in filt
     assert "acctstarttime" in filt and "$gte" in filt["acctstarttime"]
