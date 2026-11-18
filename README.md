@@ -91,7 +91,7 @@ The following commands are supported by `CPPMSpoke`:
 | `CPPM_REFRESH_CACHE` | *None* | Primes in-memory caches for Access Tracker, Device Database, and NAC Status. |
 | `TEST_AUTH` | *None* | Probes configured credentials against `/api/oauth` across grant types and returns per-attempt diagnostics. |
 | `PROBE_API` | `path`, `method`, `payload` | Executes an arbitrary raw REST request against the ClearPass API for troubleshooting. |
-| `CPPM_GET_ACCESS_TRACKER` | `limit` (default 200), `offset` (default 0), optional `lookback_hours` | Without `lookback_hours`, returns active sessions for dashboard counts; with a window, returns newest-first active and completed sessions started in that period plus `has_more` for hub pagination. |
+| `CPPM_GET_ACCESS_TRACKER` | `limit` (default 200), `offset` (default 0), optional `lookback_hours`, optional `window_end` | Without `lookback_hours`, returns active sessions for dashboard counts; with a window, returns newest-first active and completed sessions started within the stable window, plus `has_more` for hub pagination. |
 | `CPPM_GET_RECENT_SESSIONS` | `lookback_minutes` (default 2) | Live, uncached session query for the hub's realtime NAC→IPAM reverse sync loop. |
 | `CPPM_GET_DEVICE_DATABASE` | `limit` (default 200), `offset` (default 0), `status` | Lists registered endpoints from the ClearPass device inventory with optional status filter. |
 | `CPPM_GET_NAC_STATUS` | *None* | Summarizes overall NAC operational health and cluster node states. |

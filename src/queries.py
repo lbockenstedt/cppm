@@ -455,19 +455,31 @@ class CPPMQueries:
         return self._normalize_access_tracker(result)
 
     def get_recent_access_tracker(self, limit: int = 200, offset: int = 0,
-                                  lookback_hours: int = 24) -> Dict[str, Any]:
-        """Return active and closed sessions started within a bounded time window."""
+                                  lookback_hours: int = 24,
+                                  window_end: Optional[str] = None) -> Dict[str, Any]:
+        """Return sessions in a bounded window, reusing ``window_end`` for paging."""
         # Invalid windows fall back to one day; clamp the remote query to seven days.
         try:
             hours = int(lookback_hours)
         except (TypeError, ValueError):
             hours = 24
         hours = max(1, min(hours, 168))
-        # Compute the UTC lower bound used by ClearPass's acctstarttime filter.
-        start = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours)
+        # Reuse the first page's end time so offset pages share a stable snapshot.
+        if window_end is None:
+            end = _dt.datetime.now(_dt.timezone.utc)
+        else:
+            try:
+                end = _dt.datetime.strptime(window_end, "%Y-%m-%dT%H:%M:%SZ")
+                end = end.replace(tzinfo=_dt.timezone.utc)
+            except (TypeError, ValueError):
+                return {"status": "ERROR",
+                        "message": "Invalid window_end; expected UTC ISO timestamp"}
+        # Bound both ends so new authentications cannot shift later offset pages.
+        start = end - _dt.timedelta(hours=hours)
         start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso = end.strftime("%Y-%m-%dT%H:%M:%SZ")
         # Keep recent history bounded without excluding sessions that already closed.
-        recent_filter = json.dumps({"acctstarttime": {"$gte": start_iso}},
+        recent_filter = json.dumps({"acctstarttime": {"$gte": start_iso, "$lte": end_iso}},
                                    separators=(",", ":"))
         result = self.client.query(
             "/api/session",
@@ -488,6 +500,7 @@ class CPPMQueries:
             total = data.get("total")
             data["has_more"] = (type(total) is int and offset + len(data["sessions"]) < total)
             data["window_start"] = start_iso
+            data["window_end"] = end_iso
             data["lookback_hours"] = hours
         return data
 

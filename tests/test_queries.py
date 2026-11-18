@@ -216,12 +216,46 @@ def test_get_recent_access_tracker_includes_recent_closed_sessions(queries, mock
     filt = json.loads(params["filter"])
     assert "acctstoptime" not in filt
     assert "acctstarttime" in filt and "$gte" in filt["acctstarttime"]
-    parsed = _dt.datetime.strptime(
+    start = _dt.datetime.strptime(
         filt["acctstarttime"]["$gte"], "%Y-%m-%dT%H:%M:%SZ"
     ).replace(tzinfo=_dt.timezone.utc)
-    age = (_dt.datetime.now(_dt.timezone.utc) - parsed).total_seconds()
-    assert 24 * 3600 <= age <= 24 * 3600 + 5
+    end = _dt.datetime.strptime(
+        filt["acctstarttime"]["$lte"], "%Y-%m-%dT%H:%M:%SZ"
+    ).replace(tzinfo=_dt.timezone.utc)
+    assert 0 <= (_dt.datetime.now(_dt.timezone.utc) - end).total_seconds() <= 5
+    assert (end - start).total_seconds() == 24 * 3600
     assert res["window_start"] == filt["acctstarttime"]["$gte"]
+    assert res["window_end"] == filt["acctstarttime"]["$lte"]
+
+
+def test_recent_access_tracker_reuses_snapshot_end_for_next_pages(queries, mock_client):
+    """Every page uses the first page's fixed upper timestamp boundary."""
+    import json as _json
+
+    mock_client.query.return_value = {"count": 1001, "_embedded": {"items": []}}
+    end = "2026-07-02T10:00:00Z"
+
+    result = queries.get_recent_access_tracker(
+        limit=1000, offset=1000, lookback_hours=24, window_end=end
+    )
+
+    assert result["window_end"] == end
+    assert result["window_start"] == "2026-07-01T10:00:00Z"
+    assert result["has_more"] is True
+    filt = _json.loads(mock_client.query.call_args.kwargs["params"]["filter"])
+    assert filt["acctstarttime"] == {
+        "$gte": "2026-07-01T10:00:00Z", "$lte": end,
+    }
+
+
+def test_recent_access_tracker_rejects_invalid_snapshot_end(queries, mock_client):
+    """An invalid snapshot boundary is an explicit error, not a fresh window."""
+    result = queries.get_recent_access_tracker(window_end="not-a-timestamp")
+
+    assert result == {
+        "status": "ERROR", "message": "Invalid window_end; expected UTC ISO timestamp",
+    }
+    mock_client.query.assert_not_called()
 
 
 def test_get_recent_access_tracker_bounds_window_and_propagates_error(queries, mock_client):

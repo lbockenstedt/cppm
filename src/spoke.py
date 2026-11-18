@@ -212,7 +212,8 @@ class CPPMSpoke:
         # Serve from cache ONLY for a default query. The cache is keyed by command
         # NAME (refresh_cache primes it with defaults), so returning it for a
         # paged/filtered request would return the cached default page instead.
-        _default_query = not any(k in data for k in ("limit", "offset", "status", "lookback_hours"))
+        _default_query = not any(k in data for k in (
+            "limit", "offset", "status", "lookback_hours", "window_end"))
         if (normalized in CACHED and _default_query and normalized in self._cache
                 and (time.time() - self._cache_ts.get(normalized, 0)) < self._cache_ttl):
             return self._cache[normalized]
@@ -223,7 +224,8 @@ class CPPMSpoke:
                 return await asyncio.get_event_loop().run_in_executor(
                     None, lambda: self.queries.get_recent_access_tracker(
                         limit=data.get("limit", 200), offset=data.get("offset", 0),
-                        lookback_hours=data.get("lookback_hours")
+                        lookback_hours=data.get("lookback_hours"),
+                        window_end=data.get("window_end")
                     )
                 )
             return await asyncio.get_event_loop().run_in_executor(

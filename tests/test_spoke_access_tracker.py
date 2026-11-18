@@ -45,5 +45,22 @@ def test_access_tracker_window_bypasses_active_session_cache():
     assert result["sessions"] == [{"id": "closed"}]
     spoke.queries.get_access_tracker.assert_not_called()
     spoke.queries.get_recent_access_tracker.assert_called_once_with(
-        limit=200, offset=0, lookback_hours=24
+        limit=200, offset=0, lookback_hours=24, window_end=None
+    )
+
+
+def test_access_tracker_forwards_fixed_window_end_to_query():
+    """Paged history commands reuse the hub-provided snapshot upper bound."""
+    spoke = CPPMSpoke("cppm-1", {})
+    spoke.queries.get_recent_access_tracker = MagicMock(
+        return_value={"status": "SUCCESS", "sessions": [], "total": 0}
+    )
+    window_end = "2026-07-02T10:00:00Z"
+
+    _run(spoke.handle_command("CPPM_GET_ACCESS_TRACKER", {
+        "lookback_hours": 24, "window_end": window_end,
+    }))
+
+    spoke.queries.get_recent_access_tracker.assert_called_once_with(
+        limit=200, offset=0, lookback_hours=24, window_end=window_end
     )
