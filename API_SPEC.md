@@ -15,6 +15,15 @@ The CPPM Spoke integrates Lab Manager with Aruba ClearPass Policy Manager (CPPM)
   - **Response**: `{"status": "success", "message": "..."}`
 
 ### Auditing & Querying
+- **`CPPM_GET_ACCESS_TRACKER`**
+  - **Purpose**: Lists active sessions for dashboard counts, or active and
+    completed authentications started in a recent window for the Access Tracker.
+  - **Payload**: `{"limit": 200, "offset": 0, "lookback_hours": 24}`.
+    `lookback_hours` is optional; when omitted, only active sessions are
+    returned. The recent-history window is bounded to 1–168 hours.
+  - **Response**: `{"status": "SUCCESS", "sessions": [...], "total": n}`.
+    Recent-history responses also include `window_start` and
+    `lookback_hours`; API failures return an `ERROR` response.
 - **`get_device`**
   - **Purpose**: Retrieves detailed information for a specific device by its MAC address.
   - **Payload**: `{"mac": "XX:XX:XX:XX:XX:XX"}`

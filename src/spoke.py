@@ -211,15 +211,21 @@ class CPPMSpoke:
         CACHED = {"CPPM_GET_ACCESS_TRACKER", "CPPM_GET_DEVICE_DATABASE", "CPPM_GET_NAC_STATUS"}
         # Serve from cache ONLY for a default query. The cache is keyed by command
         # NAME (refresh_cache primes it with defaults), so returning it for a
-        # paged/filtered request (limit/offset/status) would hand back the cached
-        # default page/filter — a request for page 2 or status="Unknown" must go live.
-        _default_query = not any(k in data for k in ("limit", "offset", "status"))
+        # paged/filtered request would return the cached default page instead.
+        _default_query = not any(k in data for k in ("limit", "offset", "status", "lookback_hours"))
         if (normalized in CACHED and _default_query and normalized in self._cache
                 and (time.time() - self._cache_ts.get(normalized, 0)) < self._cache_ttl):
             return self._cache[normalized]
 
-        # CPPM_GET_ACCESS_TRACKER: live active sessions page.
+        # CPPM_GET_ACCESS_TRACKER: optionally include recently completed sessions.
         if normalized == "CPPM_GET_ACCESS_TRACKER":
+            if "lookback_hours" in data:
+                return await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.queries.get_recent_access_tracker(
+                        limit=data.get("limit", 200), offset=data.get("offset", 0),
+                        lookback_hours=data.get("lookback_hours")
+                    )
+                )
             return await asyncio.get_event_loop().run_in_executor(
                 None, lambda: self.queries.get_access_tracker(
                     limit=data.get("limit", 200), offset=data.get("offset", 0)

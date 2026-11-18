@@ -167,6 +167,77 @@ def test_get_recent_sessions_propagates_api_error(queries, mock_client):
     assert res["status"] == "ERROR"
 
 
+def test_get_access_tracker_remains_active_only_and_logs_no_identity(queries, mock_client, caplog):
+    """Dashboard counts stay active-only, and session identities are not logged."""
+    caplog.set_level("INFO")
+    mock_client.query.return_value = {
+        "count": 1,
+        "_embedded": {"items": [{
+            "id": 1, "username": "private-user", "callingstation": "AA:BB:CC:DD:EE:01",
+            "acctstarttime": "2026-07-01 10:00:00",
+        }]},
+    }
+
+    res = queries.get_access_tracker()
+
+    assert res["status"] == "SUCCESS"
+    assert res["total"] == 1
+    params = mock_client.query.call_args.kwargs["params"]
+    assert json.loads(params["filter"]) == {"acctstoptime": {"$exists": False}}
+    assert "private-user" not in caplog.text
+
+
+def test_get_recent_access_tracker_includes_recent_closed_sessions(queries, mock_client):
+    """The UI query uses acctstarttime, so recent completed authentications appear."""
+    import datetime as _dt
+
+    mock_client.query.return_value = {
+        "count": 1,
+        "_embedded": {"items": [{
+            "id": 42, "username": "alice", "callingstation": "AA:BB:CC:DD:EE:01",
+            "framedipaddress": "10.0.0.5", "acctstarttime": "2026-07-01 10:00:00",
+            "acctstoptime": "2026-07-01 10:10:00",
+        }]},
+    }
+
+    res = queries.get_recent_access_tracker(limit=50, offset=10, lookback_hours=24)
+
+    assert res["status"] == "SUCCESS"
+    assert res["total"] == 1
+    assert res["sessions"][0]["id"] == 42
+    assert res["sessions"][0]["username"] == "alice"
+    assert res["sessions"][0]["start_time"] == "2026-07-01T10:00:00"
+    assert res["lookback_hours"] == 24
+    params = mock_client.query.call_args.kwargs["params"]
+    assert params["limit"] == 50
+    assert params["offset"] == 10
+    filt = json.loads(params["filter"])
+    assert "acctstoptime" not in filt
+    assert "acctstarttime" in filt and "$gte" in filt["acctstarttime"]
+    parsed = _dt.datetime.strptime(
+        filt["acctstarttime"]["$gte"], "%Y-%m-%dT%H:%M:%SZ"
+    ).replace(tzinfo=_dt.timezone.utc)
+    age = (_dt.datetime.now(_dt.timezone.utc) - parsed).total_seconds()
+    assert 24 * 3600 <= age <= 24 * 3600 + 5
+    assert res["window_start"] == filt["acctstarttime"]["$gte"]
+
+
+def test_get_recent_access_tracker_bounds_window_and_propagates_error(queries, mock_client):
+    """A bad/oversized lookback cannot create an unbounded history query."""
+    import json as _json
+
+    mock_client.query.return_value = {"count": 0, "_embedded": {"items": []}}
+    result = queries.get_recent_access_tracker(lookback_hours=10000)
+
+    assert result["lookback_hours"] == 168
+    filt = _json.loads(mock_client.query.call_args.kwargs["params"]["filter"])
+    assert "acctstarttime" in filt
+
+    mock_client.query.return_value = {"status": "ERROR", "message": "ClearPass unavailable"}
+    error = queries.get_recent_access_tracker()
+    assert error == {"status": "ERROR", "message": "ClearPass unavailable"}
+
+
 def test_get_device_sessions_filters_by_callingstationid(queries, mock_client):
     """ClearPass /api/session 422s on filter key ``callingstation`` ("cannot
     filter using 'callingstation'"); the filterable field is ``callingstationid``.
