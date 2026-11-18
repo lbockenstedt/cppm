@@ -71,7 +71,7 @@ The `cppm` spoke integrates Aruba ClearPass Policy Manager with Lab Manager's hu
 
 ## Features
 
-- **Access Tracker Live Session Inspection:** Real-time query of active authentication sessions, authorization status, client IP/MAC mappings, SSID/NAS port details, and RADIUS accounting records.
+- **Access Tracker Authentication History:** Tenant-scoped query of authentications started in the last 24 hours, including completed sessions, with authorization status, client IP/MAC mappings, SSID/NAS port details, and RADIUS accounting records.
 - **Endpoint & Device Database Management:** Device inventory scanning, manual and automated endpoint upserting, vendor MAC profiling, and tenant-tag synchronization (`NetBox_Tenant_Name`, `NetBox_Tenant_ID`).
 - **Device Profiling & MAC Queries:** Detailed device lookups by MAC address or IP address with deep fallback scans across vendor attributes.
 - **System Health Monitoring:** Cluster node status, service operational state, RADIUS/TACACS+ process health, and system resource metrics.
@@ -91,7 +91,7 @@ The following commands are supported by `CPPMSpoke`:
 | `CPPM_REFRESH_CACHE` | *None* | Primes in-memory caches for Access Tracker, Device Database, and NAC Status. |
 | `TEST_AUTH` | *None* | Probes configured credentials against `/api/oauth` across grant types and returns per-attempt diagnostics. |
 | `PROBE_API` | `path`, `method`, `payload` | Executes an arbitrary raw REST request against the ClearPass API for troubleshooting. |
-| `CPPM_GET_ACCESS_TRACKER` | `limit` (default 200), `offset` (default 0) | Fetches recent access authentication sessions from `/api/session` (cached for default query). |
+| `CPPM_GET_ACCESS_TRACKER` | `limit` (default 200), `offset` (default 0), optional `lookback_hours`, optional `window_end` | Without `lookback_hours`, returns active sessions for dashboard counts; with a window, returns newest-first active and completed sessions started within the stable window, plus `has_more` for hub pagination. |
 | `CPPM_GET_RECENT_SESSIONS` | `lookback_minutes` (default 2) | Live, uncached session query for the hub's realtime NAC→IPAM reverse sync loop. |
 | `CPPM_GET_DEVICE_DATABASE` | `limit` (default 200), `offset` (default 0), `status` | Lists registered endpoints from the ClearPass device inventory with optional status filter. |
 | `CPPM_GET_NAC_STATUS` | *None* | Summarizes overall NAC operational health and cluster node states. |
