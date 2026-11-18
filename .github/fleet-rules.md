@@ -74,9 +74,11 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
    before the fix. Keep the fix only if it helped and broke nothing that
    worked before; then fix the follow-ups in a new change through the
    normal two-panel review, and whatever is still broken remains an outage.
-   If it did not help, or it broke something that worked before (DNS back
-   but login broken), revert it at once (rule 3.9) unless the owner directs
-   another mitigation. The revert undoes only that fix and needs only
+   If the live check could not run or was inconclusive, retry it once; if it
+   is still inconclusive, treat the fix as failed. If it did not help, or it
+   broke something that worked before (DNS back but login broken), or the
+   check stayed inconclusive, revert it at once (rule 3.9) unless the owner
+   directs another mitigation. The revert undoes only that fix and needs only
    smoke.sh and CI: what it brings back was reviewed, or is an earlier
    outage fix kept after its live check. The exception is for a person or
    a local session fixing a live outage; AB's own 0.90 bar (rule 10.3) does
