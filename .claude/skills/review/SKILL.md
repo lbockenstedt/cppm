@@ -129,8 +129,10 @@ example `<session folder>/files/review/<repo>`).
    live check on the outage and on what worked before the fix. Keep the fix
    only if it helped and broke nothing that worked before; then fix the
    follow-ups in a new commit and review that from step 1 in normal rounds,
-   and whatever is still broken remains an outage. If it did not help, or
-   it broke something that worked before, revert it at once (fleet rule
+   and whatever is still broken remains an outage. If the live check could
+   not run or was inconclusive, retry it once; if still inconclusive, treat
+   the fix as failed. If it did not help, it broke something that worked
+   before, or the check stayed inconclusive, revert it at once (fleet rule
    3.9) unless the owner directs another mitigation. The revert undoes only
    that fix and needs only smoke.sh and CI: what it brings back was
    reviewed, or is an earlier outage fix kept after its live check.
