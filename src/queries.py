@@ -384,30 +384,9 @@ class CPPMQueries:
 
     # --- Access Tracker ---
 
-    def get_access_tracker(self, limit: int = 200, offset: int = 0) -> Dict[str, Any]:
-        """Active sessions only from the ClearPass Access Tracker.
-
-        ClearPass ``/api/session`` returns both active and closed sessions, so
-        without a filter the list (and ``count``) grows forever as history
-        accumulates. Active sessions have no ``acctstoptime`` — filtering on
-        ``{"acctstoptime": {"$exists": false}}`` returns only sessions that have
-        not closed out. (Filtering on ``state`` is known to 500 on ClearPass.)"""
-        # Compact JSON filter selecting only sessions that have not stopped yet.
-        active_filter = json.dumps({"acctstoptime": {"$exists": False}}, separators=(",", ":"))
-        # Ask ClearPass for one page of active sessions plus the total count.
-        result = self.client.query(
-            "/api/session",
-            params={
-                "calculate_count": "true",
-                "limit": limit,
-                "offset": offset,
-                "filter": active_filter,
-            },
-        )
-        # Log the count and the first record's fields to help map ClearPass field names.
-        _items_preview = result.get('_embedded', {}).get('items', []) if isinstance(result, dict) else []
-        logger.info(f"CPPM /api/session count={result.get('count') if isinstance(result, dict) else '?'} first_item={dict(list(_items_preview[0].items())[:20]) if _items_preview else '{}'}")
-        # Pass API errors straight back to the caller.
+    def _normalize_access_tracker(self, result: Any) -> Dict[str, Any]:
+        """Normalize ClearPass sessions into the stable Access Tracker shape."""
+        # Return vendor/API errors unchanged rather than presenting them as empty data.
         if isinstance(result, dict) and result.get("status") == "ERROR":
             return result
         # Extract the list of session records from the HAL response.
@@ -449,6 +428,81 @@ class CPPMQueries:
         # Prefer the server's total count; fall back to the page length.
         total = result.get("count", len(sessions)) if isinstance(result, dict) else len(sessions)
         return {"status": "SUCCESS", "sessions": sessions, "total": total}
+
+    def get_access_tracker(self, limit: int = 200, offset: int = 0) -> Dict[str, Any]:
+        """Return active sessions only for dashboard session counts.
+
+        ClearPass ``/api/session`` includes closed sessions unless filtered.
+        Active records have no ``acctstoptime``; filtering on ``state`` is
+        known to return HTTP 500 on ClearPass.
+        """
+        # Select sessions that have not stopped yet.
+        active_filter = json.dumps({"acctstoptime": {"$exists": False}},
+                                   separators=(",", ":"))
+        # Ask ClearPass for one page of active sessions plus the total count.
+        result = self.client.query(
+            "/api/session",
+            params={
+                "calculate_count": "true",
+                "limit": limit,
+                "offset": offset,
+                "filter": active_filter,
+            },
+        )
+        # Log counts only; session identity fields must not enter service logs.
+        count = result.get("count", "?") if isinstance(result, dict) else "?"
+        logger.info("CPPM /api/session count=%s", count)
+        return self._normalize_access_tracker(result)
+
+    def get_recent_access_tracker(self, limit: int = 200, offset: int = 0,
+                                  lookback_hours: int = 24,
+                                  window_end: Optional[str] = None) -> Dict[str, Any]:
+        """Return sessions in a bounded window, reusing ``window_end`` for paging."""
+        # Invalid windows fall back to one day; clamp the remote query to seven days.
+        try:
+            hours = int(lookback_hours)
+        except (TypeError, ValueError):
+            hours = 24
+        hours = max(1, min(hours, 168))
+        # Reuse the first page's end time so offset pages share a stable snapshot.
+        if window_end is None:
+            end = _dt.datetime.now(_dt.timezone.utc)
+        else:
+            try:
+                end = _dt.datetime.strptime(window_end, "%Y-%m-%dT%H:%M:%SZ")
+                end = end.replace(tzinfo=_dt.timezone.utc)
+            except (TypeError, ValueError):
+                return {"status": "ERROR",
+                        "message": "Invalid window_end; expected UTC ISO timestamp"}
+        # Bound both ends so new authentications cannot shift later offset pages.
+        start = end - _dt.timedelta(hours=hours)
+        start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Keep recent history bounded without excluding sessions that already closed.
+        recent_filter = json.dumps({"acctstarttime": {"$gte": start_iso, "$lte": end_iso}},
+                                   separators=(",", ":"))
+        result = self.client.query(
+            "/api/session",
+            params={
+                "calculate_count": "true",
+                "limit": limit,
+                "offset": offset,
+                "sort": "-id",
+                "filter": recent_filter,
+            },
+        )
+        # Log counts only; session identity fields must not enter service logs.
+        count = result.get("count", "?") if isinstance(result, dict) else "?"
+        logger.info("CPPM /api/session recent count=%s", count)
+        data = self._normalize_access_tracker(result)
+        # Mark the history window so the hub can detect older spokes that ignored it.
+        if data.get("status") == "SUCCESS":
+            total = data.get("total")
+            data["has_more"] = (type(total) is int and offset + len(data["sessions"]) < total)
+            data["window_start"] = start_iso
+            data["window_end"] = end_iso
+            data["lookback_hours"] = hours
+        return data
 
     def get_recent_sessions(self, lookback_minutes: int = 2) -> Dict[str, Any]:
         """Sessions that started within the last ``lookback_minutes`` (Access
