@@ -13,6 +13,18 @@ The CPPM Spoke integrates Lab Manager with Aruba ClearPass Policy Manager (CPPM)
   - **Purpose**: Updates the connection credentials for the CPPM server.
   - **Payload**: `{"host": "string", "user": "string", "password": "string"}`
   - **Response**: `{"status": "success", "message": "..."}`
+- **`TEST_AUTH`**
+  - **Purpose**: Tries every OAuth grant the configured credentials allow
+    against `POST /api/oauth` and reports each outcome (diagnostics).
+  - **Payload**: `{}`
+  - **Response**: `{"status": "SUCCESS", "auth_attempts": [{"attempt", "result", "detail"}, ...]}`.
+    `result` is `SUCCESS`, `OK_BUT_NO_TOKEN`, `HTTP <code>` or `EXCEPTION`.
+    A failed `HTTP <code>` attempt whose reply names a known cause also has
+    `hint`, saying what to do: for "Replication: Writes on …" (the node
+    refuses database writes, so it cannot issue a token; likely a
+    subscriber, or cut off from its publisher), point LM at the cluster's
+    publisher. With no credentials:
+    `{"status": "ERROR", "message": "No credentials configured"}`.
 
 ### Auditing & Querying
 - **`CPPM_GET_ACCESS_TRACKER`**
@@ -28,6 +40,16 @@ The CPPM Spoke integrates Lab Manager with Aruba ClearPass Policy Manager (CPPM)
   - **Response**: `{"status": "SUCCESS", "sessions": [...], "total": n}`.
     Recent-history responses also include `window_start`, `window_end`,
     `lookback_hours`, and `has_more`; API failures return an `ERROR` response.
+- **`CPPM_GET_NAC_STATUS`**
+  - **Purpose**: The NAC landing page totals: sessions that have not ended,
+    and all, Known and Unknown endpoints.
+  - **Payload**: `{}`
+  - **Response**: `{"status": "SUCCESS", "active_sessions", "total_devices", "known_devices", "unknown_devices"}`.
+    Each count is an integer, or `null` when its query failed or returned no
+    count (the WebUI shows "—", never 0). When every count query fails it
+    returns the first query's `ERROR` reply unchanged (its `message` carries
+    ClearPass's reason), or `{"status": "ERROR", "message": "ClearPass returned no counts"}` when
+    none returned an error or a count. The spoke caches only `SUCCESS`.
 - **`get_device`**
   - **Purpose**: Retrieves detailed information for a specific device by its MAC address.
   - **Payload**: `{"mac": "XX:XX:XX:XX:XX:XX"}`

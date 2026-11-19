@@ -324,3 +324,39 @@ def test_get_all_endpoints_pages_past_the_first_page(queries, mock_client):
 
     assert [d["mac"] for d in res["devices"]] == ["m0", "m1", "m2", "m3", "m4"]
     assert res["total"] == 5
+
+
+# ── NAC status: a failed count is unknown, not 0 ─────────────────────────────
+def _count_reply(n):
+    """A ClearPass calculate_count reply holding ``n``."""
+    return {"_embedded": {"items": []}, "count": n}
+
+
+def test_get_nac_status_reports_the_counts(queries, mock_client):
+    mock_client.query.side_effect = [_count_reply(3), _count_reply(10), _count_reply(7), _count_reply(0)]
+    assert queries.get_nac_status() == {"status": "SUCCESS", "active_sessions": 3,
+                                        "total_devices": 10, "known_devices": 7,
+                                        "unknown_devices": 0}
+
+
+def test_get_nac_status_failed_count_is_unknown_not_zero(queries, mock_client):
+    # A profile without Session read keeps its device counts; the rest show "—".
+    denied = {"status": "ERROR", "message": "403 Client Error", "code": 403}
+    mock_client.query.side_effect = [denied, _count_reply(10), _count_reply(7), {"_embedded": {}}]
+    assert queries.get_nac_status() == {"status": "SUCCESS", "active_sessions": None,
+                                        "total_devices": 10, "known_devices": 7,
+                                        "unknown_devices": None}
+
+
+def test_get_nac_status_all_failed_returns_the_first_error(queries, mock_client):
+    # A ClearPass refusing every call (e.g. a read-only node with no token) is
+    # not an empty network: the first error, with its reason, comes back.
+    first = {"status": "ERROR", "message": "ClearPass refused a database write …", "code": 403}
+    other = {"status": "ERROR", "message": "403 Client Error", "code": 403}
+    mock_client.query.side_effect = [first, other, other, other]
+    assert queries.get_nac_status() is first
+
+
+def test_get_nac_status_no_counts_at_all_is_an_error(queries, mock_client):
+    mock_client.query.return_value = {"_embedded": {"items": []}}
+    assert queries.get_nac_status() == {"status": "ERROR", "message": "ClearPass returned no counts"}

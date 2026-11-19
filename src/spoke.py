@@ -10,7 +10,7 @@ import asyncio
 from typing import Any, Dict
 # High-level ClearPass queries and the low-level REST client they use.
 from queries import CPPMQueries
-from client import CPPMClient
+from client import CPPMClient, auth_failure_hint
 # os locates the VERSION file; logging records commands; time drives cache expiry.
 import os
 import logging
@@ -178,10 +178,15 @@ class CPPMSpoke:
                         token = resp.json().get("access_token")
                         results.append({"attempt": label, "result": "SUCCESS" if token else "OK_BUT_NO_TOKEN",
                                         "detail": resp.json()})
-                    # Record the HTTP status and a short body excerpt.
+                    # Record the HTTP status, a short body excerpt and, when the body
+                    # names a known cause, what to do about it.
                     else:
-                        results.append({"attempt": label, "result": f"HTTP {resp.status_code}",
-                                        "detail": resp.text[:300]})
+                        attempt = {"attempt": label, "result": f"HTTP {resp.status_code}",
+                                   "detail": resp.text[:300]}
+                        hint = auth_failure_hint(resp.text)
+                        if hint:
+                            attempt["hint"] = hint
+                        results.append(attempt)
                 # Record network/TLS exceptions.
                 except Exception as e:
                     results.append({"attempt": label, "result": "EXCEPTION", "detail": str(e)})

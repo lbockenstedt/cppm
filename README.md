@@ -89,12 +89,12 @@ The following commands are supported by `CPPMSpoke`:
 | `GET_VERSION` | *None* | Returns the spoke's semantic version from the `VERSION` file. |
 | `UPDATE_CONFIG` | `host`, `user`, `password`, `client_id`, `client_secret`, `verify_ssl` | Reconfigures ClearPass target host, API credentials, and SSL verification mode dynamically. |
 | `CPPM_REFRESH_CACHE` | *None* | Primes in-memory caches for Access Tracker, Device Database, and NAC Status. |
-| `TEST_AUTH` | *None* | Probes configured credentials against `/api/oauth` across grant types and returns per-attempt diagnostics. |
+| `TEST_AUTH` | *None* | Probes configured credentials against `/api/oauth` across grant types and returns per-attempt diagnostics. A failed attempt whose reply names a known cause also carries a `hint` saying what to do. |
 | `PROBE_API` | `path`, `method`, `payload` | Executes an arbitrary raw REST request against the ClearPass API for troubleshooting. |
 | `CPPM_GET_ACCESS_TRACKER` | `limit` (default 200), `offset` (default 0), optional `lookback_hours`, optional `window_end` | Without `lookback_hours`, returns active sessions for dashboard counts; with a window, returns newest-first active and completed sessions started within the stable window, plus `has_more` for hub pagination. |
 | `CPPM_GET_RECENT_SESSIONS` | `lookback_minutes` (default 2) | Live, uncached session query for the hub's realtime NAC→IPAM reverse sync loop. |
 | `CPPM_GET_DEVICE_DATABASE` | `limit` (default 200), `offset` (default 0), `status` | Lists registered endpoints from the ClearPass device inventory with optional status filter. |
-| `CPPM_GET_NAC_STATUS` | *None* | Summarizes overall NAC operational health and cluster node states. |
+| `CPPM_GET_NAC_STATUS` | *None* | Counts active sessions and all, Known and Unknown endpoints. A count whose query failed is `null` (shown as "—"), never 0; when every count fails it returns the first error (or "ClearPass returned no counts"). |
 | `CPPM_GET_SYSTEM_HEALTH` | *None* | Inspects server hardware metrics, disk, memory, CPU, and running daemon status. |
 | `GET_DEVICE` | `mac` | Queries endpoint attributes and status for a specific MAC address. |
 | `LIST_ENDPOINTS` | *None* | Returns endpoint listings from the device database. |
