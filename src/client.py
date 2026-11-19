@@ -12,7 +12,7 @@ import time
 # logging records auth and request problems for operators.
 import logging
 # Type hints only; they document the shapes of values passed around.
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 def load_dotenv():
     """Load environment variables from a local .env file if present."""
@@ -114,10 +114,6 @@ class CPPMClient:
         # Cached OAuth access token and the epoch time at which it expires.
         self._token: Optional[str] = None
         self._token_expiry: float = 0.0
-        # Why the last token run failed, when a reply named a known cause
-        # (auth_failure_hint), else "". Diagnostic text only: a token run on
-        # another thread may reset it, which at worst drops it from one message.
-        self._auth_hint = ""
 
         # One shared session reuses connections and carries the TLS verify setting.
         self.session = requests.Session()
@@ -146,10 +142,9 @@ class CPPMClient:
         # Only change TLS mode when the caller specified one.
         if verify_ssl is not None:
             self.session.verify = _as_bool(verify_ssl)
-        # Forget any token issued for the old host/credentials, and why the last run failed.
+        # Forget any token issued for the old host/credentials.
         self._token = None
         self._token_expiry = 0.0
-        self._auth_hint = ""
         self.session.auth = None  # clear any stale basic auth from previous attempts
         # Record the reconfiguration for troubleshooting.
         logger.info(f"CPPM client reconfigured for host: {host} (verify_ssl={self.session.verify})")
@@ -163,8 +158,11 @@ class CPPMClient:
         # Drop any trailing slash so endpoint paths join cleanly.
         return host.rstrip("/")
 
-    def _try_oauth(self, body: dict) -> Optional[str]:
-        """Attempt a single OAuth2 token request; return access_token or None."""
+    def _try_oauth(self, body: dict, hints: List[str]) -> Optional[str]:
+        """Attempt a single OAuth2 token request; return access_token or None.
+
+        A refusal whose reply names a known cause (auth_failure_hint) adds that
+        hint to ``hints``, the list of the token run this request belongs to."""
         # Remember grant type and client id for log messages.
         grant = body.get("grant_type")
         cid = body.get("client_id", "<none>")
@@ -180,8 +178,8 @@ class CPPMClient:
             # names a known cause, what to do about it; then give up on this grant.
             if not resp.ok:
                 hint = auth_failure_hint(resp.text)
-                if hint:
-                    self._auth_hint = hint
+                if hint and hint not in hints:
+                    hints.append(hint)
                 logger.warning(f"OAuth {grant} (client_id={cid}): HTTP {resp.status_code} — {resp.text[:200]}"
                                + (f" — {hint}" if hint else ""))
                 return None
@@ -202,13 +200,18 @@ class CPPMClient:
             logger.warning(f"OAuth {grant} (client_id={cid}) exception: {e}")
             return None
 
-    def _get_token(self) -> Optional[str]:
-        """Retrieve valid OAuth2 bearer token from cache or request a new one."""
+    def _get_token(self, hints: Optional[List[str]] = None) -> Optional[str]:
+        """Retrieve valid OAuth2 bearer token from cache or request a new one.
+
+        When no token is obtained and a reply named a known cause, the hint is
+        added to ``hints``; it stays empty otherwise. Each caller passes its own
+        list rather than reading client state, so a token run on another thread
+        can never add, or erase, the cause given for this call's failure."""
         # Reuse the cached token until 30 seconds before it expires.
         if self._token and time.time() < self._token_expiry - 30:
             return self._token
-        # A new token run: forget why the last one failed.
-        self._auth_hint = ""
+        # Known causes this run's refusals named; private when the caller passed no list.
+        hints = [] if hints is None else hints
 
         # Build candidates in preference order.
         # password grant (user context) is preferred over client_credentials when
@@ -243,18 +246,18 @@ class CPPMClient:
 
         # Try each candidate in order and keep the first token that works.
         for body in candidates:
-            token = self._try_oauth(body)
+            token = self._try_oauth(body, hints)
             if token:
                 self._token = token
                 # A grant worked, so an earlier grant's failure explains nothing.
-                self._auth_hint = ""
+                hints.clear()
                 return token
 
         # Explain why no token could be obtained, with what to do when a reply named the cause.
         if not candidates:
             logger.warning("No OAuth2 credentials available — cannot obtain token")
         else:
-            logger.error("All OAuth2 attempts failed" + (f": {self._auth_hint}" if self._auth_hint else ""))
+            logger.error("All OAuth2 attempts failed" + (f": {' '.join(hints)}" if hints else ""))
         # No token: the caller may fall back to basic auth.
         return None
 
@@ -269,7 +272,9 @@ class CPPMClient:
         headers = kwargs.pop("headers", {})
 
         # Prefer a bearer token; otherwise fall back to HTTP basic auth if credentials exist.
-        token = self._get_token()
+        # auth_hints gets the known cause, if any, of this request's own failed token run.
+        auth_hints: List[str] = []
+        token = self._get_token(auth_hints)
         request_auth = None
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -302,11 +307,11 @@ class CPPMClient:
             code = e.response.status_code if e.response is not None else None
             logger.error("HTTP error %s for %s %s: %s", code, method, url, detail or "<no body>")
             msg = str(e) if not detail else f"{e} | body: {detail}"
-            # Sent without a token: when the failed token run named its cause (a
-            # read-only ClearPass node), that explains this refusal, so say it
-            # first. The transport errors below are unrelated, so they do not.
-            if not token and self._auth_hint:
-                msg = f"{self._auth_hint} {msg}"
+            # Sent without a token: when this request's failed token run named its
+            # cause (a read-only ClearPass node), that explains this refusal, so
+            # say it first. The transport errors below are unrelated, so they do not.
+            if not token and auth_hints:
+                msg = f"{' '.join(auth_hints)} {msg}"
             return {"status": "ERROR", "message": msg, "code": code}
         except requests.exceptions.SSLError as e:
             # A TLS verification failure against a self-signed ClearPass is the

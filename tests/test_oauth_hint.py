@@ -85,25 +85,48 @@ def test_hint_dropped_when_a_later_grant_works(monkeypatch):
     # Password grants are tried first; the second one gets a token.
     c = CPPMClient(host="cppm.example.com", user="admin", password="pw")
     _replies(monkeypatch, c, _resp(500, READ_ONLY_BODY), _resp(200, TOKEN_BODY))
-    assert c._get_token() == "tok"
-    assert c._auth_hint == ""
+    hints = []
+    assert c._get_token(hints) == "tok"
+    assert hints == []
 
 
-def test_new_token_run_and_reconfigure_forget_the_hint(monkeypatch):
+def test_each_token_run_names_only_its_own_cause(monkeypatch):
     c = _api_client()
-    _replies(monkeypatch, c, _resp(500, READ_ONLY_BODY), _resp(401, "{}"), _resp(500, READ_ONLY_BODY))
-    assert c._get_token() is None and c._auth_hint == HINT
+    _replies(monkeypatch, c, _resp(500, READ_ONLY_BODY), _resp(401, "{}"))
+    first, second = [], []
+    assert c._get_token(first) is None and first == [HINT]
     # The next run fails for another reason, so the old cause no longer applies.
-    assert c._get_token() is None and c._auth_hint == ""
-    # Pointing the client elsewhere (e.g. at the publisher) forgets it too.
-    c._get_token()
-    c.update_config(host="publisher.example.com", client_id="lm", client_secret="s")
-    assert c._auth_hint == ""
+    assert c._get_token(second) is None and second == []
+
+
+OTHER_REPLY = (401, '{"error":"invalid_client"}')
+READ_ONLY_REPLY = (500, READ_ONLY_BODY)
+
+
+@pytest.mark.parametrize("a_reply, b_reply", [(OTHER_REPLY, READ_ONLY_REPLY), (READ_ONLY_REPLY, OTHER_REPLY)])
+def test_a_concurrent_token_run_never_changes_this_calls_cause(monkeypatch, a_reply, b_reply):
+    # Request B's token run on the same client, made while request A's call is in
+    # flight, neither lends A its cause nor erases A's own.
+    c = _api_client()
+    _replies(monkeypatch, c, _resp(*a_reply), _resp(*b_reply))
+    b_hints = []
+
+    def a_call(*args, **kwargs):
+        """A's API call: B's token run happens while it is in flight, then ClearPass refuses A."""
+        assert c._get_token(b_hints) is None
+        return _resp(403, "Forbidden")
+
+    monkeypatch.setattr(c.session, "request", a_call)
+    r = c._request("GET", "api/session")
+    assert r["code"] == 403
+    assert r["message"].startswith(HINT) == (a_reply == READ_ONLY_REPLY)
+    assert HINT not in r["message"][len(HINT):]
+    assert b_hints == ([HINT] if b_reply == READ_ONLY_REPLY else [])
 
 
 def test_test_auth_attempt_carries_the_hint(monkeypatch):
     spoke = CPPMSpoke("cppm-1", {})
-    spoke.client.host, spoke.client.client_id, spoke.client.client_secret = "cppm.example.com", "lm", "s"
+    spoke.client.update_config(host="cppm.example.com", client_id="lm", client_secret="s")
     _replies(monkeypatch, spoke.client, _resp(500, READ_ONLY_BODY))
     r = asyncio.new_event_loop().run_until_complete(spoke.handle_command("TEST_AUTH", {}))
     [attempt] = r["auth_attempts"]
@@ -112,7 +135,7 @@ def test_test_auth_attempt_carries_the_hint(monkeypatch):
 
 def test_test_auth_other_failure_has_no_hint(monkeypatch):
     spoke = CPPMSpoke("cppm-1", {})
-    spoke.client.host, spoke.client.client_id, spoke.client.client_secret = "cppm.example.com", "lm", "s"
+    spoke.client.update_config(host="cppm.example.com", client_id="lm", client_secret="s")
     _replies(monkeypatch, spoke.client, _resp(401, '{"error":"invalid_client"}'))
     r = asyncio.new_event_loop().run_until_complete(spoke.handle_command("TEST_AUTH", {}))
     [attempt] = r["auth_attempts"]
