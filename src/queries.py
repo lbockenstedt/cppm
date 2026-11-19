@@ -658,7 +658,12 @@ class CPPMQueries:
 
         ``active_sessions`` counts only sessions that have not closed out (no
         ``acctstoptime``); without this filter ClearPass returns every session
-        ever recorded and the count grows monotonically."""
+        ever recorded and the count grows monotonically.
+
+        A count whose query failed is None (unknown), not 0. When every query
+        fails this returns the first error instead, so a ClearPass that refuses
+        every call (for example a read-only node that cannot issue a token) is
+        not shown, or cached, as an empty network."""
         # Compact JSON filter selecting only sessions that have not stopped yet.
         active_filter = json.dumps({"acctstoptime": {"$exists": False}}, separators=(",", ":"))
         # Four independent count queries, run SERIALLY. They share one
@@ -676,14 +681,29 @@ class CPPMQueries:
             params={"calculate_count": "true", "limit": 1, "filter": '{"status":"Known"}'})
         unknown_result = self.client.query("/api/endpoint",
             params={"calculate_count": "true", "limit": 1, "filter": '{"status":"Unknown"}'})
-        # Pull the count from each result, using 0 when a query failed.
-        return {
-            "status": "SUCCESS",
-            "active_sessions": sessions_result.get("count", 0) if isinstance(sessions_result, dict) else 0,
-            "total_devices": devices_result.get("count", 0) if isinstance(devices_result, dict) else 0,
-            "known_devices": known_result.get("count", 0) if isinstance(known_result, dict) else 0,
-            "unknown_devices": unknown_result.get("count", 0) if isinstance(unknown_result, dict) else 0,
-        }
+        results = {"active_sessions": sessions_result, "total_devices": devices_result,
+                   "known_devices": known_result, "unknown_devices": unknown_result}
+        # A query that failed, or came back without a count, is unknown (None,
+        # shown as "—"), never 0: a ClearPass refusing every call is not empty.
+        counts = {key: self._count(res) for key, res in results.items()}
+        # Nothing answered: return the first error (it carries ClearPass's reason)
+        # so neither the spoke nor the hub caches a page of unknowns as fresh.
+        if all(count is None for count in counts.values()):
+            return next((res for res in results.values()
+                         if isinstance(res, dict) and res.get("status") == "ERROR"),
+                        {"status": "ERROR", "message": "ClearPass returned no counts"})
+        # Some answered: keep those; a profile without one read right still gets the rest.
+        return {"status": "SUCCESS", **counts}
+
+    @staticmethod
+    def _count(result: Any) -> Optional[int]:
+        """The ``count`` of a ``calculate_count`` reply, or None when the query
+        failed or the reply has no integer count."""
+        if isinstance(result, dict) and result.get("status") != "ERROR":
+            count = result.get("count")
+            if isinstance(count, int) and not isinstance(count, bool):
+                return count
+        return None
 
     # --- Existing queries ---
 

@@ -69,6 +69,26 @@ def _env_verify_tls() -> bool:
     return True
 
 
+# ClearPass refuses a database write on a node whose database is read-only (a
+# subscriber, or a node cut off from its publisher) with an error such as HTTP
+# 500 "SQLSTATE[P0001]: Raise exception: 7 ERROR: Replication: Writes on t…".
+# Issuing an OAuth token is such a write, so every token request fails and the
+# API calls made without a token are then refused (403). Matched
+# case-insensitively anywhere in the reply body.
+_READ_ONLY_DB_TEXT = "replication: writes on"
+# What the operator should do about it; added to the logs and error messages.
+_READ_ONLY_DB_HINT = ("ClearPass refused a database write on this node, so it cannot issue an "
+                      "OAuth token: the node is likely a subscriber, or cut off from its "
+                      "publisher. Point LM at the cluster's publisher.")
+
+
+def auth_failure_hint(text: Any) -> str:
+    """Return what an operator should do about a failed OAuth reply body, or ""
+    when the body names no cause we know. The only known cause is ClearPass's
+    read-only database reply ("Replication: Writes on …", ``_READ_ONLY_DB_TEXT``)."""
+    return _READ_ONLY_DB_HINT if _READ_ONLY_DB_TEXT in str(text or "").lower() else ""
+
+
 class CPPMClient:
     """REST client for Aruba ClearPass Policy Manager.
 
@@ -94,6 +114,10 @@ class CPPMClient:
         # Cached OAuth access token and the epoch time at which it expires.
         self._token: Optional[str] = None
         self._token_expiry: float = 0.0
+        # Why the last token run failed, when a reply named a known cause
+        # (auth_failure_hint), else "". Diagnostic text only: a token run on
+        # another thread may reset it, which at worst drops it from one message.
+        self._auth_hint = ""
 
         # One shared session reuses connections and carries the TLS verify setting.
         self.session = requests.Session()
@@ -122,9 +146,10 @@ class CPPMClient:
         # Only change TLS mode when the caller specified one.
         if verify_ssl is not None:
             self.session.verify = _as_bool(verify_ssl)
-        # Forget any token issued for the old host/credentials.
+        # Forget any token issued for the old host/credentials, and why the last run failed.
         self._token = None
         self._token_expiry = 0.0
+        self._auth_hint = ""
         self.session.auth = None  # clear any stale basic auth from previous attempts
         # Record the reconfiguration for troubleshooting.
         logger.info(f"CPPM client reconfigured for host: {host} (verify_ssl={self.session.verify})")
@@ -151,9 +176,14 @@ class CPPMClient:
                 auth=None,
                 timeout=10,
             )
-            # Rejected request: log the status and a short body excerpt, then give up on this grant.
+            # Rejected request: log the status, a short body excerpt and, when the body
+            # names a known cause, what to do about it; then give up on this grant.
             if not resp.ok:
-                logger.warning(f"OAuth {grant} (client_id={cid}): HTTP {resp.status_code} — {resp.text[:200]}")
+                hint = auth_failure_hint(resp.text)
+                if hint:
+                    self._auth_hint = hint
+                logger.warning(f"OAuth {grant} (client_id={cid}): HTTP {resp.status_code} — {resp.text[:200]}"
+                               + (f" — {hint}" if hint else ""))
                 return None
             # Decode the token response.
             data = resp.json()
@@ -177,6 +207,8 @@ class CPPMClient:
         # Reuse the cached token until 30 seconds before it expires.
         if self._token and time.time() < self._token_expiry - 30:
             return self._token
+        # A new token run: forget why the last one failed.
+        self._auth_hint = ""
 
         # Build candidates in preference order.
         # password grant (user context) is preferred over client_credentials when
@@ -214,13 +246,15 @@ class CPPMClient:
             token = self._try_oauth(body)
             if token:
                 self._token = token
+                # A grant worked, so an earlier grant's failure explains nothing.
+                self._auth_hint = ""
                 return token
 
-        # Explain why no token could be obtained.
+        # Explain why no token could be obtained, with what to do when a reply named the cause.
         if not candidates:
             logger.warning("No OAuth2 credentials available — cannot obtain token")
         else:
-            logger.error("All OAuth2 attempts failed")
+            logger.error("All OAuth2 attempts failed" + (f": {self._auth_hint}" if self._auth_hint else ""))
         # No token: the caller may fall back to basic auth.
         return None
 
@@ -268,6 +302,11 @@ class CPPMClient:
             code = e.response.status_code if e.response is not None else None
             logger.error("HTTP error %s for %s %s: %s", code, method, url, detail or "<no body>")
             msg = str(e) if not detail else f"{e} | body: {detail}"
+            # Sent without a token: when the failed token run named its cause (a
+            # read-only ClearPass node), that explains this refusal, so say it
+            # first. The transport errors below are unrelated, so they do not.
+            if not token and self._auth_hint:
+                msg = f"{self._auth_hint} {msg}"
             return {"status": "ERROR", "message": msg, "code": code}
         except requests.exceptions.SSLError as e:
             # A TLS verification failure against a self-signed ClearPass is the
