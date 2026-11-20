@@ -269,11 +269,17 @@ def _missing_root_pem(ca_pems: list) -> Optional[str]:
     # An empty chain has no last cert to inspect.
     if not ca_pems:
         return None
-    # Parse the last cert of the chain; imported lazily as cryptography is optional.
+    # Parse the last cert of the chain. cryptography is in requirements.txt;
+    # the lazy import keeps a broken install from stopping the whole spoke.
     try:
         from cryptography import x509
+    except ImportError:
+        logger.warning("cryptography is not installed: cannot add a missing "
+                       "Let's Encrypt root to the CTL (re-run install.sh)")
+        return None
+    try:
         last = x509.load_pem_x509_certificate(ca_pems[-1].encode())
-    # Unparseable cert or missing library: leave the chain unchanged.
+    # Unparseable cert: leave the chain unchanged.
     except Exception:
         return None
     if last.issuer == last.subject:          # self-signed → root already present
@@ -316,7 +322,7 @@ def _cert_subject_cn(pem: str) -> str:
     """Best-effort Common Name from a PEM cert, for idempotency matching +
     diagnostics. Returns ``""`` on any parse failure (the caller treats an
     empty CN as 'unknown' and still POSTs)."""
-    # Parse the PEM (lazy import; cryptography is optional) and read the first cert's CN.
+    # Parse the PEM (lazy import of the required cryptography) and read the first cert's CN.
     try:
         from cryptography import x509
         certs = x509.load_pem_x509_certificates(pem.encode())

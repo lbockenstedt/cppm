@@ -20,17 +20,15 @@ from src.queries import CPPMQueries
 
 
 # ── Real self-signed cert+key so the modern PKCS12 builder (cryptography)
-# validates the PEM end-to-end. Skips the suite if cryptography isn't
-# installed (the spoke host has it; CI should too). ────────────────────────
+# validates the PEM end-to-end. cryptography is in requirements.txt, so CI
+# and every spoke venv have it. ──────────────────────────────────────────────
 def _real_pair():
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        from cryptography.x509.oid import NameOID
-        import datetime
-    except Exception:
-        pytest.skip("cryptography not installed")
+    # cryptography is a declared requirement: a missing install fails, never skips.
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    import datetime
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "lm-test")])
     now = datetime.datetime.utcnow()
@@ -294,14 +292,12 @@ def test_import_cert_put_error_surfaces(monkeypatch):
 def _real_chain():
     """A leaf cert + an issuing CA cert (both self-signed for the test). Returns
     (fullchain_pem, chain_pem, leaf_cn, ca_cn, privkey)."""
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        from cryptography.x509.oid import NameOID
-        import datetime
-    except Exception:
-        pytest.skip("cryptography not installed")
+    # cryptography is a declared requirement: a missing install fails, never skips.
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    import datetime
     now = datetime.datetime.utcnow()
     leaf_cn, ca_cn = "leaf.example.com", "ISRG Root X1"
 
@@ -369,14 +365,12 @@ def _le_chain(root_cn="ISRG Root X1"):
     subject=R3 / issuer=<root_cn> so it is NOT self-signed by name, which is the
     signal ``_missing_root_pem`` keys on. Returns
     (fullchain_pem, chain_pem, intermediate_pem, root_cn, leaf_privkey)."""
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        from cryptography.x509.oid import NameOID
-        import datetime
-    except Exception:
-        pytest.skip("cryptography not installed")
+    # cryptography is a declared requirement: a missing install fails, never skips.
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    import datetime
     now = datetime.datetime.utcnow()
 
     def _cert(subj_cn, iss_cn, key):

@@ -2,3 +2,4 @@ requests
 websockets
 fastapi
 uvicorn
+cryptography
