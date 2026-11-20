@@ -5,7 +5,7 @@ endpoint inventory search, tenant tagging/sync, and certificate installation,
 normalising ClearPass's varied field names into stable dictionaries.
 """
 # Type hints only; they document the shapes of values passed around.
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 # Low-level authenticated REST client for ClearPass.
 from client import CPPMClient
 # datetime for timestamps, json for payloads, logging for diagnostics, re for parsing.
@@ -943,7 +943,47 @@ class CPPMQueries:
         # Return all candidate IP values.
         return ips
 
-    def _build_ip_endpoint_map(self, target_ips: set) -> Dict[str, Dict[str, Any]]:
+    def _page_problem(self, res: Any, offset: int, limit: int,
+                      expected: Optional[int] = None) -> Optional[str]:
+        """Why one page of a full /api/endpoint scan cannot be trusted, or None.
+
+        A scan that must cover the whole inventory (the replace-scan, the
+        IP → endpoint map) treats these pages as a partial scan: an ERROR
+        reply; a body that is not a page of endpoints (not a dict with an
+        ``_embedded`` list or an ``items`` list); a count below the rows already
+        returned (e.g. a full page with ``count: 0``), which proves nothing about
+        where the inventory ends; a short page that ends before the reported
+        count; a full page with no integer count, after which more pages
+        cannot be ruled out; and a count that differs from ``expected`` (the
+        first page's), because offset paging over an inventory that changed
+        mid-scan can stop before pages the first count promised."""
+        # An ERROR reply, or a body that is not a page of items.
+        if isinstance(res, dict) and res.get("status") == "ERROR":
+            return f"endpoint list failed at offset {offset}: {res.get('message')}"
+        embedded = res.get("_embedded") if isinstance(res, dict) else None
+        if not ((isinstance(embedded, dict)
+                 and any(isinstance(v, list) for v in embedded.values()))
+                or (isinstance(res, dict) and isinstance(res.get("items"), list))):
+            return f"endpoint list at offset {offset} returned no item list"
+        # The page must reach the reported count, or carry one when full.
+        n = len(self._items(res))
+        count = res.get("count")
+        count = count if isinstance(count, int) and not isinstance(count, bool) else None
+        if count is not None and expected is not None and count != expected:
+            return (f"endpoint list count changed from {expected} to {count} "
+                    "mid-scan — cannot tell where the inventory ends")
+        if count is not None and count < offset + n:
+            return (f"endpoint list count {count} is below the {offset + n} "
+                    "rows returned — cannot tell where the inventory ends")
+        if n < limit and count is not None and offset + n < count:
+            return f"endpoint list ended at {offset + n} of {count}"
+        if n >= limit and count is None:
+            return (f"endpoint list at offset {offset} has no count — cannot "
+                    "tell whether more pages follow")
+        return None
+
+    def _build_ip_endpoint_map(self, target_ips: set
+                               ) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
         """Bounded paged scan of the endpoint inventory building IP → endpoint
         for the requested IPs. Used when a NetBox IP record has no MAC: the
         ClearPass ``ip_address`` filter (``_get_endpoint_by_ip``) only matches
@@ -952,56 +992,72 @@ class CPPMQueries:
         reused and the endpoint tagged for the tenant.
 
         Stops early once every requested IP is resolved or ``SYNC_SCAN_CAP`` is
-        hit. Best-effort: a CPPM paging failure returns whatever resolved so far
-        (the sync then skips the unresolved IPs as before). Logs scanned-vs-total
-        so a cap hit (or a small inventory where the IP genuinely isn't present)
-        is distinguishable from a real miss."""
+        hit. Returns ``(resolved, problem)``: ``problem`` is None when the scan
+        covered the whole inventory (or resolved every IP), so an IP missing
+        from ``resolved`` is confirmed absent; otherwise it says why the scan
+        stopped early (a page ``_page_problem`` rejects, or the cap), and what
+        resolved so far is still returned. Logs scanned-vs-total so a cap hit
+        (or a small inventory where the IP genuinely isn't present) is
+        distinguishable from a real miss."""
         # Result map and the set of non-empty IPs still being looked for.
         resolved: Dict[str, Dict[str, Any]] = {}
         wanted = {str(ip).strip() for ip in target_ips if str(ip).strip()}
         if not wanted:
-            return resolved
+            return resolved, None
         # Paging state: scan cap, page size, offset, rows scanned and server total.
         cap = self.SYNC_SCAN_CAP
         limit = 1000
         offset = 0
         scanned = 0
         total = 0
+        problem: Optional[str] = f"scan capped at {cap} endpoints"
+        first_count: Optional[int] = None
         # Page through the inventory until the cap is reached.
         while scanned < cap:
             # Fetch one page of endpoints with the total count.
             ep_r = self.client.query("/api/endpoint", params={
                 "limit": limit, "offset": offset, "calculate_count": "true"})
-            # Paging failure: log and return what has been resolved so far.
-            if isinstance(ep_r, dict) and ep_r.get("status") == "ERROR":
-                logger.warning("endpoint IP-map scan failed: %s", ep_r.get("message"))
-                break
-            # An empty page means the inventory is exhausted.
-            items = self._items(ep_r)
-            if not items:
-                break
-            # Record the first endpoint seen for each wanted IP.
+            # Record the first endpoint seen for each wanted IP. Rows on a page
+            # _page_problem rejects (a short page ending before its count, an
+            # inconsistent count) are still real endpoints, so use them too.
+            page_problem = self._page_problem(ep_r, offset, limit, first_count)
+            items = self._items(ep_r) if isinstance(ep_r, dict) else []
             for ep in items:
                 for ip in self._endpoint_ips(ep):
                     if ip in wanted and ip not in resolved:
                         resolved[ip] = ep
-            # Advance the counters and remember the server total.
             scanned += len(items)
-            total = ep_r.get("count", total) if isinstance(ep_r, dict) else total
-            offset += limit
-            # Stop at the last page or once every wanted IP is resolved.
-            if len(items) < limit or offset >= total:
-                break
+            # Every wanted IP resolved: nothing is left to confirm absent.
             if all(ip in resolved for ip in wanted):
+                problem = None
+                break
+            # A page that cannot be trusted: stop, keeping what resolved so far.
+            if page_problem:
+                logger.warning("endpoint IP-map scan failed: %s", page_problem)
+                problem = page_problem
+                break
+            # An empty page means the inventory is exhausted.
+            if not items:
+                problem = None
+                break
+            # Remember the server total.
+            count = ep_r.get("count")
+            total = count if isinstance(count, int) and not isinstance(count, bool) else total
+            if first_count is None and isinstance(count, int) and not isinstance(count, bool):
+                first_count = count
+            offset += limit
+            # Stop at the last page.
+            if len(items) < limit or offset >= total:
+                problem = None
                 break
         # Log coverage so a cap hit can be told apart from a genuine miss.
         logger.info("endpoint IP-map scan: scanned %d of %d endpoints (cap %d, %s); "
                     "resolved %d of %d wanted IPs",
                     scanned, total, cap,
-                    "CAPPED — raise SYNC_SCAN_CAP" if scanned >= cap else "complete",
+                    f"INCOMPLETE: {problem}" if problem else "complete",
                     len(resolved), len(wanted))
-        # Return the IP-to-endpoint map.
-        return resolved
+        # Return the IP-to-endpoint map and why it is incomplete, if it is.
+        return resolved, problem
 
     def _build_mac_endpoint_map(self, target_macs: set) -> Dict[str, Dict[str, Any]]:
         """Bounded paged scan of the endpoint inventory building normalized
@@ -1133,8 +1189,14 @@ class CPPMQueries:
                          tenant_id: str, tenant_name: str,
                          source: str,
                          ip_map: Optional[Dict[str, Dict[str, Any]]] = None,
-                         mac_map: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
+                         mac_map: Optional[Dict[str, Dict[str, Any]]] = None,
+                         matched_ids: Optional[set] = None) -> str:
         """Upsert one endpoint. Returns 'pushed' | 'skipped' | 'error'.
+
+        ``matched_ids`` collects the id of every existing endpoint this record
+        resolved to, whether or not the PUT then succeeds: the replace-scan
+        keeps those, because an IP-only record resolved to an endpoint keyed
+        by a MAC the batch does not carry.
 
         Keyed on MAC (authoritative); falls back to IP lookup when MAC is empty.
         Existing endpoints are PUT-merged (so profiler-derived attributes are
@@ -1192,6 +1254,8 @@ class CPPMQueries:
         if existing:
             # Without an id the endpoint cannot be updated.
             ep_id = existing.get("id")
+            if ep_id and matched_ids is not None:
+                matched_ids.add(str(ep_id))
             if not ep_id:
                 return "error"
             # Merge tenant tags over the current attributes and make every value a string.
@@ -1309,13 +1373,19 @@ class CPPMQueries:
         return True
 
     def _remove_absent_tagged(self, tenant_id: str, batch_keys: set,
-                              allow_mass_remove: bool = False) -> int:
+                              allow_mass_remove: bool = False,
+                              keep_ids: Optional[set] = None,
+                              keep_ips: Optional[set] = None) -> Tuple[int, List[str]]:
         """Delete endpoints tagged with this tenant whose key is not in the batch.
 
         Pages through /api/endpoint and filters client-side by the tenant
         attribute (ClearPass's filter support for arbitrary attributes is
         inconsistent across versions, so a client-side scan is the reliable
-        path). Returns the number deleted.
+        path). Returns ``(removed, failed)``: the number deleted, and one
+        ``"<id>: <reason>"`` entry per DELETE that failed (an ERROR or non-dict
+        reply, or a raised error), so the caller can report ERROR for stale
+        endpoints that are still in ClearPass. One failed DELETE does not stop
+        the others.
 
         SAFETY: this DELETEs every tenant-tagged endpoint whose key is absent
         from ``batch_keys``. An empty/truncated/failed batch would therefore
@@ -1330,7 +1400,19 @@ class CPPMQueries:
         ``allow_mass_remove`` skips guard 2 only, for a one-off sync an operator
         has confirmed (the tenant's IPAM data really did shrink). Guard 1 always
         applies.
+
+        ``keep_ids`` are endpoints this sync resolved a batch record to (an
+        IP-only record matched to an endpoint keyed by its MAC); they are in
+        the batch even though their key is not. ``keep_ips`` are the IPs of
+        IP-only records that resolved to no endpoint this pass (the lookup
+        failed or found nothing): an endpoint carrying one of them may be that
+        record's, so it is kept rather than deleted on a failed lookup. A page
+        that fails to load, is not a page of endpoints, or ends the list before
+        its reported count aborts the scan with nothing deleted: guard 2 is
+        only meaningful over the whole tagged set.
         """
+        keep_ids = keep_ids or set()
+        keep_ips = keep_ips or set()
         # Guard 1: an empty batch means the upstream produced no endpoints
         # (empty/truncated/failed). Reconciling against nothing would delete
         # the whole tagged inventory — refuse.
@@ -1347,17 +1429,24 @@ class CPPMQueries:
         to_delete: List[str] = []  # endpoint ids
         limit = 1000
         offset = 0
+        first_count: Optional[int] = None
         # Page through the whole endpoint inventory.
         while True:
             # Fetch one page of endpoints with the total count.
             res = self.client.query("/api/endpoint", params={
                 "limit": limit, "offset": offset, "calculate_count": "true"})
-            # Paging failure: log and stop scanning (deletions are then based on what was seen).
-            if isinstance(res, dict) and res.get("status") == "ERROR":
-                logger.warning("replace-scan list failed: %s", res.get("message"))
-                break
-            # An empty page means the inventory is exhausted.
+            # A page that cannot be trusted (failed, not a page, short of its
+            # count, or full with no count) leaves part of the inventory
+            # unscanned: abort before any DELETE. A partial tally would also
+            # let guard 2 pass on a removal it would refuse over the whole set.
+            page_problem = self._page_problem(res, offset, limit, first_count)
+            if page_problem:
+                raise ReplaceScanAborted(f"{page_problem} — nothing removed")
             items = self._items(res)
+            count = res.get("count")
+            count = count if isinstance(count, int) and not isinstance(count, bool) else None
+            if first_count is None:
+                first_count = count
             if not items:
                 break
             # Only endpoints tagged with this tenant are candidates for removal.
@@ -1372,7 +1461,8 @@ class CPPMQueries:
                 ip = ip_val.strip() if isinstance(ip_val, str) else ""
                 key = mac or f"ip:{ip}"
                 # Endpoints still present in the batch are kept.
-                if key in batch_keys:
+                if (key in batch_keys or str(ep.get("id")) in keep_ids
+                        or (keep_ips and self._endpoint_ips(ep) & keep_ips)):
                     continue
                 # Endpoints without an id cannot be deleted; otherwise queue it for removal.
                 ep_id = ep.get("id")
@@ -1380,9 +1470,8 @@ class CPPMQueries:
                     continue
                 to_delete.append(ep_id)
             # Advance to the next page; stop at the last page.
-            count = res.get("count", 0) if isinstance(res, dict) else 0
             offset += limit
-            if len(items) < limit or offset >= count:
+            if len(items) < limit or count is None or offset >= count:
                 break
 
         # Guard 2: refuse a removal that would take out more than half of the
@@ -1395,17 +1484,23 @@ class CPPMQueries:
                 f"{len(to_delete)} of {tagged_total} tagged endpoints (>50%) — "
                 "likely a truncated/failed batch; refusing to mass-delete")
 
-        # Pass 2: delete each queued endpoint, counting successes and logging failures.
+        # Pass 2: delete each queued endpoint, counting successes and
+        # collecting failures (ERROR reply, non-dict reply or a raised error).
         removed = 0
+        failed: List[str] = []
         for ep_id in to_delete:
-            d = self.client._request("DELETE", f"/api/endpoint/{ep_id}")
+            try:
+                d = self.client._request("DELETE", f"/api/endpoint/{ep_id}")
+            except Exception as e:
+                d = {"status": "ERROR", "message": str(e)}
             if isinstance(d, dict) and d.get("status") != "ERROR":
                 removed += 1
-            else:
-                logger.warning("endpoint DELETE %s failed: %s", ep_id,
-                               d.get("message") if isinstance(d, dict) else d)
-        # Number of endpoints actually removed.
-        return removed
+                continue
+            reason = d.get("message") if isinstance(d, dict) else d
+            logger.warning("endpoint DELETE %s failed: %s", ep_id, reason)
+            failed.append(f"{ep_id}: {reason}")
+        # Endpoints actually removed, and the ones still in ClearPass.
+        return removed, failed
 
     def sync_endpoints(self, tenant_id: str, tenant_name: str,
                        source: str, endpoints: List[Dict[str, Any]],
@@ -1476,14 +1571,23 @@ class CPPMQueries:
         # batch-level map is the attribute-based fallback (``IP Address`` etc.)
         # built once so we don't re-scan the inventory per record.
         # Build the IP map; a failure means only the exact ip_address filter is used.
+        # ``ip_map_problem`` is None only when the map covered the whole
+        # inventory, so an IP-only record it did not resolve is confirmed
+        # absent (skipped); otherwise such a record is unknown (an error).
         ip_map: Optional[Dict[str, Dict[str, Any]]] = None
+        ip_map_problem: Optional[str] = None
         ip_only = {ip for _, mac, ip, _ in batch if not mac and ip}
         if ip_only:
             try:
-                ip_map = self._build_ip_endpoint_map(ip_only)
+                ip_map, ip_map_problem = self._build_ip_endpoint_map(ip_only)
                 # Count how many IP-only records were resolved and log a warning when none were.
                 resolved_n = len({ip for ip in ip_only if ip in ip_map})
-                if ip_only and resolved_n == 0:
+                if ip_map_problem:
+                    logger.warning("endpoint sync tenant=%s IP→endpoint map incomplete "
+                                   "(%s): resolved %d of %d IP-only records; the rest "
+                                   "are reported as errors, not skipped",
+                                   tenant_id, ip_map_problem, resolved_n, len(ip_only))
+                elif resolved_n == 0:
                     logger.warning("endpoint sync tenant=%s: IP→endpoint map resolved "
                                    "0 of %d IP-only records — ClearPass has no endpoint "
                                    "carrying any of these IPs, so they will be skipped "
@@ -1502,6 +1606,7 @@ class CPPMQueries:
                                "(falling back to exact ip_address filter only)",
                                tenant_id, e)
                 ip_map = None
+                ip_map_problem = f"IP-map build failed: {e}"
 
         # Fallback MAC source for IP-only records the endpoint inventory did NOT
         # resolve: a live ClearPass session (Access Tracker) whose
@@ -1511,8 +1616,17 @@ class CPPMQueries:
         # typical 802.1X+DHCP sessions don't carry framedipaddress, so this often
         # resolves 0 — logged so it's distinguishable from a silent skip.
         # IPs still without an endpoint; try borrowing a MAC from live sessions.
+        # Only after a complete IP map: with a partial one, the IP may sit on an
+        # endpoint the scan never reached, and a borrowed MAC would skip the
+        # exact IP lookup and the keep-protection below, so the upsert could
+        # create a second endpoint and the replace-scan delete the real one.
+        # Those records stay IP-only and are reported as unresolved instead.
         unresolved = ip_only - set(ip_map or {})
-        if unresolved:
+        if unresolved and ip_map_problem:
+            logger.warning("endpoint sync tenant=%s: session MAC fallback skipped for "
+                           "%d unresolved IP-only record(s), endpoint lookup "
+                           "incomplete (%s)", tenant_id, len(unresolved), ip_map_problem)
+        elif unresolved:
             try:
                 # Build the session map and log how many MACs were borrowed.
                 session_mac_map = self._build_session_ip_mac_map(unresolved)
@@ -1545,6 +1659,11 @@ class CPPMQueries:
         # Per-outcome counters, error messages and details of skipped records.
         pushed = errors = skipped = 0
         err_msgs: List[str] = []
+        # Existing endpoints the batch resolved to, and IPs of IP-only records
+        # that resolved to none; the replace-scan keeps both.
+        matched_ids: set = set()
+        unresolved_ips: set = set()
+        lookup_incomplete: List[str] = []
         skipped_details: List[Dict[str, Any]] = []
         # First sync carrying a role override: make sure LM_Role is in the dictionary.
         if not self._role_attr_ready and any(str(r.get("nac_role") or "").strip() for _, _, _, r in batch):
@@ -1554,13 +1673,21 @@ class CPPMQueries:
                 logger.warning("ensure %s attribute failed: %s", self.ROLE_ATTR, e)
         # Upsert every batch record; one failure must not stop the rest.
         for key, mac, ip, rec in batch:
+            # This record's own match: two records may resolve to one endpoint.
+            rec_matched: set = set()
             try:
                 outcome = self._upsert_endpoint(mac, ip, rec, tenant_id,
                                                  tenant_name, source,
-                                                 ip_map=ip_map, mac_map=mac_map)
+                                                 ip_map=ip_map, mac_map=mac_map,
+                                                 matched_ids=rec_matched)
                 # Tally the outcome reported by the upsert.
                 if outcome == "pushed":
                     pushed += 1
+                # An IP-only record that matched nothing while the IP map was
+                # incomplete may still have an endpoint: unknown, not skipped.
+                elif outcome == "skipped" and not mac and ip and ip_map_problem:
+                    errors += 1
+                    lookup_incomplete.append(ip)
                 elif outcome == "skipped":
                     skipped += 1
                     # _upsert_endpoint already logged the per-record reason; capture
@@ -1579,13 +1706,30 @@ class CPPMQueries:
             except Exception as e:
                 errors += 1
                 err_msgs.append(f"{key}: {e}")
+            # An IP-only record that matched no endpoint (none found, or the
+            # lookup failed): its endpoint, if any, is unknown, so keep them all.
+            matched_ids |= rec_matched
+            if not mac and not rec_matched:
+                unresolved_ips.add(ip)
+        # One summary line for the records the incomplete IP map left unknown.
+        if lookup_incomplete:
+            err_msgs.append(f"{len(lookup_incomplete)} IP-only record(s) unresolved, "
+                            f"endpoint lookup incomplete ({ip_map_problem}): "
+                            + ", ".join(lookup_incomplete[:5]))
 
         # Replace mode: remove tenant-tagged endpoints that are no longer in the batch.
         removed = 0
         if replace:
             try:
-                removed = self._remove_absent_tagged(
-                    tenant_id, batch_keys, allow_mass_remove=allow_mass_remove)
+                removed, failed = self._remove_absent_tagged(
+                    tenant_id, batch_keys, allow_mass_remove=allow_mass_remove,
+                    keep_ids=matched_ids, keep_ips=unresolved_ips)
+                # A stale endpoint whose DELETE failed is still in ClearPass:
+                # count each one as an error so the sync reports ERROR.
+                if failed:
+                    errors += len(failed)
+                    err_msgs.append(f"stale delete failed for {len(failed)} "
+                                    f"endpoint(s): " + "; ".join(failed[:3]))
             except ReplaceScanAborted as e:
                 # Deliberate safety abort (empty/runaway batch) — count it as an
                 # error so the sync reports ERROR rather than a silent success
@@ -1594,9 +1738,13 @@ class CPPMQueries:
                 err_msgs.append(f"replace-scan aborted: {e}")
                 logger.error("endpoint sync tenant=%s replace-scan aborted: %s",
                              tenant_id, e)
-            # Other replace-scan failures are reported but do not mark the sync as failed.
+            # Any other replace-scan failure also left stale endpoints in place,
+            # so the sync did not finish its job: report ERROR, not SUCCESS.
             except Exception as e:
+                errors += 1
                 err_msgs.append(f"replace-scan: {e}")
+                logger.error("endpoint sync tenant=%s replace-scan failed: %s",
+                             tenant_id, e)
 
         # Log a one-line summary of every skipped record.
         if skipped_details:

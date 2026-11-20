@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from client import CPPMClient
-from queries import CPPMQueries
+from queries import CPPMQueries, ReplaceScanAborted
 
 
 @pytest.fixture
@@ -521,3 +521,275 @@ def test_list_roles_pages_and_filters_prefix(queries, mock_client):
     roles = queries.list_roles("SSPLM-")
     assert [r["name"] for r in roles] == ["SSPLM-DMZ", "SSPLM-ROUTED"]
     assert mock_client.query.call_args.kwargs["params"]["offset"] == 1000
+
+
+def _tagged(ep_id, mac, **attrs):
+    """A ClearPass endpoint already tagged for tenant lrb."""
+    return {"id": ep_id, "mac_address": mac, "attributes": {"NetBox_Tenant_ID": "lrb", **attrs}}
+
+
+def _deleted(mock_client):
+    """Paths of every DELETE the sync sent."""
+    return [c.args[1] for c in mock_client._request.call_args_list if c.args[0] == "DELETE"]
+
+
+_KEPT = [_tagged(91, "aa:aa:aa:aa:aa:01"), _tagged(92, "aa:aa:aa:aa:aa:02")]
+_KEPT_RECS = [{"ip": "", "mac": "aa:aa:aa:aa:aa:01"}, {"ip": "", "mac": "aa:aa:aa:aa:aa:02"}]
+
+
+def test_replace_keeps_the_endpoint_an_ip_only_record_resolved_to(queries, mock_client):
+    """An IP-only record tags the existing endpoint carrying its IP; that
+    endpoint is keyed by its MAC, which the batch does not carry, and the
+    same pass must not delete it."""
+    ep = _tagged(90, "11:22:33:44:55:66", **{"IP Address": "172.16.1.62"})
+
+    def query_side(path, params=None):
+        if params and "filter" in params:
+            return _hal([], 0)
+        return _hal([ep] + _KEPT)
+
+    mock_client.query.side_effect = query_side
+    mock_client._request.return_value = {"id": 1}
+    result = queries.sync_endpoints(
+        "lrb", "LRB", "NetBox", replace=True,
+        endpoints=[{"ip": "172.16.1.62", "mac": ""}] + _KEPT_RECS)
+    assert result["status"] == "SUCCESS" and result["pushed"] == 3
+    assert _deleted(mock_client) == []
+
+
+def test_replace_keeps_an_endpoint_whose_ip_only_record_failed_to_resolve(queries, mock_client):
+    """The IP lookups for an IP-only record fail, so the sync does not know
+    which endpoint is that record's; one carrying its IP is kept."""
+    ep = _tagged(90, "11:22:33:44:55:66", **{"IP Address": "172.16.1.62"})
+    stale = _tagged(93, "aa:aa:aa:aa:aa:03", **{"IP Address": "172.16.1.99"})
+    mock_client.query.return_value = _hal([ep, stale] + _KEPT + [_tagged(94, "aa:aa:aa:aa:aa:04")])
+    mock_client._request.return_value = {"status": "SUCCESS"}
+
+    def lookup_fails(*a, **k):
+        raise RuntimeError("ClearPass timeout")
+
+    queries._get_endpoint_by_ip = lookup_fails
+    queries._build_ip_endpoint_map = lookup_fails
+    result = queries.sync_endpoints(
+        "lrb", "LRB", "NetBox", replace=True,
+        endpoints=[{"ip": "172.16.1.62", "mac": ""}] + _KEPT_RECS
+        + [{"ip": "", "mac": "aa:aa:aa:aa:aa:04"}])
+    assert result["status"] == "ERROR"
+    # The record whose lookup failed keeps its endpoint; a real stale one goes.
+    assert _deleted(mock_client) == ["/api/endpoint/93"]
+
+
+def test_replace_scan_page_failure_deletes_nothing(queries, mock_client):
+    """A later page failing leaves only a partial tally, on which the >50%
+    guard means nothing: abort with nothing deleted."""
+    page1 = [_tagged(i, f"aa:00:00:00:{i // 256:02x}:{i % 256:02x}") for i in range(1000)]
+    keys = {ep["mac_address"] for ep in page1[1:]}
+    mock_client.query.side_effect = [_hal(page1, 5000), {"status": "ERROR", "message": "502"}]
+    with pytest.raises(ReplaceScanAborted):
+        queries._remove_absent_tagged("lrb", keys)
+    assert _deleted(mock_client) == []
+
+
+def test_replace_scan_failure_reports_error(queries, mock_client):
+    """Stale removal that did not run is not a SUCCESS."""
+    mock_client.query.return_value = _hal([], 0)
+    mock_client._request.return_value = {"id": 1}
+
+    def scan_fails(*a, **k):
+        raise RuntimeError("connection reset")
+
+    queries._remove_absent_tagged = scan_fails
+    result = queries.sync_endpoints("lrb", "LRB", "NetBox", replace=True,
+                                    endpoints=[{"ip": "", "mac": "aa:aa:aa:aa:aa:01"}])
+    assert result["status"] == "ERROR" and "replace-scan: connection reset" in result["message"]
+
+
+_PAGE1 = [_tagged(i, f"aa:00:00:00:{i // 256:02x}:{i % 256:02x}") for i in range(1000)]
+
+
+@pytest.mark.parametrize("pages", [
+    [_hal(_PAGE1, 5000), {"message": "upstream busy"}],
+    [_hal(_PAGE1, 5000), None],
+    [_hal(_PAGE1, 5000), _hal(_PAGE1[:10], 5000)],
+    [{"_embedded": {"items": _PAGE1}}],
+    [_hal(_PAGE1, 0)],
+    [_hal(_PAGE1[:10], 3)],
+    [_hal(_PAGE1, 3000), _hal(_PAGE1, 2000)],
+], ids=["message-only", "no-body", "short-before-count", "full-page-no-count",
+        "full-page-count-zero", "count-below-rows", "count-changed-mid-scan"])
+def test_replace_scan_partial_inventory_deletes_nothing(queries, mock_client, pages):
+    """A page that is not a page of endpoints, or a list that stops before
+    its count, is a partial scan: abort with nothing deleted."""
+    keys = {ep["mac_address"] for ep in _PAGE1[1:]}
+    mock_client.query.side_effect = pages
+    with pytest.raises(ReplaceScanAborted):
+        queries._remove_absent_tagged("lrb", keys)
+    assert _deleted(mock_client) == []
+
+
+def test_replace_two_ip_only_records_on_one_endpoint_still_remove_stale(queries, mock_client):
+    """Two IP-only records resolve to the same endpoint; both resolved, so
+    a stale endpoint carrying the second IP is not kept for them."""
+    ep = _tagged(90, "11:22:33:44:55:66", **{"IP Address": "172.16.1.62"})
+    stale = _tagged(93, "aa:aa:aa:aa:aa:03", **{"IP Address": "172.16.1.63"})
+
+    def query_side(path, params=None):
+        if params and "filter" in params:
+            return _hal([], 0)
+        return _hal([ep, stale] + _KEPT)
+
+    mock_client.query.side_effect = query_side
+    mock_client._request.return_value = {"id": 1}
+    queries._get_endpoint_by_ip = lambda ip: ep
+    result = queries.sync_endpoints(
+        "lrb", "LRB", "NetBox", replace=True,
+        endpoints=[{"ip": "172.16.1.62", "mac": ""}, {"ip": "172.16.1.63", "mac": ""}]
+        + _KEPT_RECS)
+    assert result["status"] == "SUCCESS"
+    assert _deleted(mock_client) == ["/api/endpoint/93"]
+
+
+@pytest.mark.parametrize("failure", ["error_body", "non_dict", "raises"])
+def test_replace_reports_error_when_a_stale_delete_fails(queries, mock_client, failure):
+    """A stale endpoint whose DELETE fails is still in ClearPass, so the sync
+    reports ERROR (not a clean SUCCESS), and the other DELETEs still run."""
+    stale = [_tagged(93, "aa:aa:aa:aa:aa:03"), _tagged(94, "aa:aa:aa:aa:aa:04")]
+    mock_client.query.return_value = _hal(stale + _KEPT + [_tagged(95, "aa:aa:aa:aa:aa:05"),
+                                                           _tagged(96, "aa:aa:aa:aa:aa:06")])
+    bad = {"error_body": {"status": "ERROR", "message": "HTTP 500"},
+           "non_dict": None, "raises": RuntimeError("connection reset")}[failure]
+
+    def request_side(method, path, **kw):
+        if method == "DELETE" and path.endswith("/93"):
+            if isinstance(bad, Exception):
+                raise bad
+            return bad
+        return {"id": 1}
+
+    mock_client._request.side_effect = request_side
+    result = queries.sync_endpoints(
+        "lrb", "LRB", "NetBox", replace=True,
+        endpoints=_KEPT_RECS + [{"ip": "", "mac": "aa:aa:aa:aa:aa:05"},
+                                {"ip": "", "mac": "aa:aa:aa:aa:aa:06"}])
+    assert _deleted(mock_client) == ["/api/endpoint/93", "/api/endpoint/94"]
+    assert result["status"] == "ERROR"
+    assert result["errors"] == 1 and result["removed"] == 1
+    assert "stale delete failed for 1 endpoint(s): 93" in result["message"]
+
+
+def _ip_lookup_side(map_pages, inventory, exact):
+    """query() fake: the exact ``ip_address`` filter returns ``exact``; the
+    unfiltered endpoint scans return ``map_pages`` in turn (the MAC map when
+    the batch has MACs, then the IP map), then ``inventory`` (the
+    replace-scan); sessions are empty."""
+    pages = list(map_pages)
+
+    def side(path, params=None):
+        if path == "/api/session":
+            return _hal([], 0)
+        if params and "filter" in params:
+            return exact
+        return pages.pop(0) if pages else inventory
+    return side
+
+
+@pytest.mark.parametrize("bad_page", [
+    {"status": "ERROR", "message": "HTTP 500"},   # failed
+    {"message": "busy"},                          # not a page of endpoints
+    _hal([], 5),                                  # ends before its count
+    _hal(_PAGE1, 0),                              # count below the rows returned
+])
+def test_ip_only_record_is_an_error_when_the_ip_map_scan_is_incomplete(queries, mock_client, bad_page):
+    """The IP map could not cover the inventory and the exact filter failed
+    too: the record's endpoint is unknown, so the sync reports ERROR (not a
+    clean skip) and keeps any endpoint carrying the record's IP."""
+    ep = _tagged(90, "11:22:33:44:55:66", **{"IP Address": "172.16.1.62"})
+    mock_client.query.side_effect = _ip_lookup_side(
+        [_hal([ep] + _KEPT), bad_page], _hal([ep] + _KEPT),
+        {"status": "ERROR", "message": "HTTP 500"})
+    mock_client._request.return_value = {"id": 1}
+    result = queries.sync_endpoints(
+        "lrb", "LRB", "NetBox", replace=True,
+        endpoints=[{"ip": "172.16.1.62", "mac": ""}] + _KEPT_RECS)
+    assert result["status"] == "ERROR"
+    assert result["errors"] == 1 and result["skipped"] == 0
+    assert "1 IP-only record(s) unresolved, endpoint lookup incomplete" in result["message"]
+    assert _deleted(mock_client) == []
+
+
+def test_ip_only_record_is_an_error_when_the_ip_map_scan_hits_its_cap(queries, mock_client):
+    queries.SYNC_SCAN_CAP = 1000
+    mock_client.query.side_effect = _ip_lookup_side([_hal(_PAGE1, 2000)], _hal([]), _hal([], 0))
+    result = queries.sync_endpoints("lrb", "LRB", "NetBox", replace=False,
+                                    endpoints=[{"ip": "172.16.1.62", "mac": ""}])
+    assert result["status"] == "ERROR" and result["skipped"] == 0
+    assert "scan capped at 1000 endpoints" in result["message"]
+
+
+def test_ip_only_record_is_skipped_when_a_complete_ip_map_confirms_it_absent(queries, mock_client):
+    """The full IP map covers the first-class ip_address field too, so a
+    failed exact filter does not make a confirmed absence an error."""
+    mock_client.query.side_effect = _ip_lookup_side(
+        [_hal(_KEPT)], _hal(_KEPT), {"status": "ERROR", "message": "HTTP 500"})
+    result = queries.sync_endpoints("lrb", "LRB", "NetBox", replace=False,
+                                    endpoints=[{"ip": "172.16.1.62", "mac": ""}])
+    assert result["status"] == "SUCCESS"
+    assert result["skipped"] == 1 and result["errors"] == 0
+
+
+def test_ip_map_resolves_from_a_short_page_before_reporting_it_incomplete(queries, mock_client):
+    """A short page that ends before its count still carries real endpoints:
+    an IP on it resolves, and the map is reported incomplete only while a
+    wanted IP is still missing."""
+    ep = _tagged(90, "11:22:33:44:55:66", **{"IP Address": "172.16.1.62"})
+    mock_client.query.return_value = _hal([ep], 5)
+    resolved, problem = queries._build_ip_endpoint_map({"172.16.1.62", "172.16.1.63"})
+    assert resolved == {"172.16.1.62": ep} and problem == "endpoint list ended at 1 of 5"
+    resolved, problem = queries._build_ip_endpoint_map({"172.16.1.62"})
+    assert resolved == {"172.16.1.62": ep} and problem is None
+
+
+def test_ip_map_is_incomplete_when_the_count_changes_mid_scan(queries, mock_client):
+    """Page 1 promised 3000 endpoints and page 2 says 2000: offset paging
+    over a changing inventory may have skipped rows, so an unresolved IP is
+    not confirmed absent."""
+    mock_client.query.side_effect = [_hal(_PAGE1, 3000), _hal(_PAGE1, 2000)]
+    resolved, problem = queries._build_ip_endpoint_map({"172.16.1.62"})
+    assert resolved == {}
+    assert problem == ("endpoint list count changed from 3000 to 2000 mid-scan "
+                       "— cannot tell where the inventory ends")
+
+
+@pytest.mark.parametrize("exact_finds_it", [True, False])
+def test_incomplete_ip_map_borrows_no_session_mac(queries, mock_client, exact_finds_it):
+    """The IP map failed, so a session that lends the record's IP a different
+    MAC must not turn it into a MAC record: that skipped the exact IP lookup,
+    POSTed a second endpoint and let the replace-scan delete the real one."""
+    ep = _tagged(90, "11:22:33:44:55:66", ip_address="172.16.1.62")
+    session = {"framedipaddress": "172.16.1.62", "callingstationid": "AABBCCDDEEFF"}
+    side = _ip_lookup_side([_hal([ep] + _KEPT), {"status": "ERROR", "message": "HTTP 500"}],
+                           _hal([ep] + _KEPT), _hal([ep] if exact_finds_it else []))
+
+    def query(path, params=None):
+        if path == "/api/session":
+            return _hal([session], 1)
+        # The borrowed MAC has no endpoint; only the IP filter can find ep.
+        if params and "mac_address" in params.get("filter", ""):
+            return _hal([])
+        return side(path, params)
+
+    mock_client.query.side_effect = query
+    mock_client._request.return_value = {"id": 90}
+    result = queries.sync_endpoints(
+        "lrb", "LRB", "NetBox", replace=True,
+        endpoints=[{"ip": "172.16.1.62", "mac": ""}] + _KEPT_RECS)
+    methods = [c.args[:2] for c in mock_client._request.call_args_list]
+    assert ("POST", "/api/endpoint") not in methods
+    assert _deleted(mock_client) == []
+    if exact_finds_it:
+        # The exact filter found the real endpoint, so it is the one tagged.
+        assert ("PUT", "/api/endpoint/90") in methods
+        assert result["status"] == "SUCCESS"
+    else:
+        assert result["status"] == "ERROR"
+        assert "1 IP-only record(s) unresolved, endpoint lookup incomplete" in result["message"]
