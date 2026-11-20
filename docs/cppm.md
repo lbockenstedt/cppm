@@ -25,7 +25,7 @@ Talk to ClearPass REST (`CPPMClient`, `src/client.py`, `requests.Session`, TLS v
 
 ## Install flags
 
-`install.sh`: `--hub`, `--id`/`--name`, `--secret`, `--hub-secret`, `--all-prereqs` (no-op). Keeps default PSK `lm-secret` for zero-touch.
+`install.sh`: `--hub`, `--id`/`--name`, `--secret`, `--hub-secret`, `--all-prereqs` (no-op). Keeps default PSK `lm-secret` for zero-touch. A re-run updates only the keys it owns in `.env`: a flag given wins, and `--hub`/`--secret`/`--hub-secret` left out keep their `.env` value; `SPOKE_ID` is reset from `--id` or the hostname; other lines are kept. `HUB_SECRET` is written (the unit passes `--hub-secret=$HUB_SECRET`). `.env` is `svc_lm`-owned, mode 0600; `svc_lm` is created if missing. The `.env` update runs as `svc_lm` (`runuser`) under `flock` on `.env.lock`, the lock the spoke takes when it rotates a secret.
 
 ## Key commands / handlers (`spoke.handle_command`, via `run_in_executor` — `CPPMQueries` is sync `requests`)
 

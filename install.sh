@@ -4,15 +4,22 @@ set -e
 # Default Configuration
 HUB_URL="auto"   # was ws://localhost:8765 (retired bare listener); auto-discover the unified :443 hub
 SPOKE_ID="${SPOKE_ID:-cppm-$(hostname -s)}"
-SPOKE_SECRET="lm-secret"
+SPOKE_SECRET=""
+HUB_SECRET=""
+# Set to 1 by the matching flag. A value not given on this run is kept from the
+# existing .env (see "Configuring Spoke Identity" below), so a re-run for a code
+# update keeps the spoke's secrets and hub. SPOKE_ID is not kept: as before, it
+# derives from the hostname unless --id is given, so a renamed clone takes its
+# new name.
+HUB_URL_GIVEN=""; SPOKE_SECRET_GIVEN=""; HUB_SECRET_GIVEN=""
 
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        --hub) HUB_URL="$2"; shift ;;
+        --hub) HUB_URL="$2"; HUB_URL_GIVEN=1; shift ;;
         --id|--name) SPOKE_ID="$2"; shift ;;
-        --secret) SPOKE_SECRET="$2"; shift ;;
-        --hub-secret) HUB_SECRET="$2"; shift ;;
+        --secret) SPOKE_SECRET="$2"; SPOKE_SECRET_GIVEN=1; shift ;;
+        --hub-secret) HUB_SECRET="$2"; HUB_SECRET_GIVEN=1; shift ;;
         --all-prereqs) ;;  # no-op; accepted for LM hub compat
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
@@ -28,16 +35,6 @@ if [ -n "${HUB_URL:-}" ] && [ "$HUB_URL" != "auto" ]; then
         *:[0-9]*)       HUB_URL="wss://${HUB_URL}" ;;
         *)              HUB_URL="wss://${HUB_URL}:443" ;;
     esac
-fi
-
-if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lm-secret" ]; then
-    # Keep the default PSK "lm-secret" (do NOT clear to "") so the =-attached
-    # ExecStart below (--secret=$SPOKE_SECRET) resolves to "lm-secret" at
-    # runtime — matching the prior bare `--secret` argparse const="lm-secret"
-    # zero-touch behavior. Clearing to "" would make `--secret=` pass an empty
-    # string (pending negotiation) instead of the default-PSK path.
-    SPOKE_SECRET="lm-secret"
-    echo "ℹ️  No pre-shared secret — spoke will connect with the default PSK 'lm-secret' (zero-touch; the hub auto-approves the default PSK or awaits admin approval in the LM WebUI)."
 fi
 
 echo "🚀 Installing ClearPass Policy Manager (CPPM) Module (Native)..."
@@ -160,6 +157,14 @@ else
     git clone --branch "${CPPM_BRANCH:-main}" https://github.com/lbockenstedt/cppm.git
 fi
 
+# The service user the unit runs as (User=svc_lm), shared with the rest of LM.
+# Created here when missing: without it the chown below failed silently and
+# systemd refused to start the unit (217/USER).
+if ! id svc_lm >/dev/null 2>&1; then
+    useradd -r -s /bin/false -M svc_lm
+    echo "👤 Created service user svc_lm"
+fi
+
 # The git clone/reset above ran as root; the spoke runs as svc_lm and
 # self-updates via `git reset --hard`/`git pull` as that user — root-owned
 # .git/objects → "insufficient permission for adding an object" → self-update
@@ -189,11 +194,66 @@ fi
 
 # --- Persistence Configuration ---
 echo "⚙️ Configuring Spoke Identity..."
-cat <<EOF > .env
-HUB_URL=$HUB_URL
-SPOKE_ID=$SPOKE_ID
-SPOKE_SECRET=$SPOKE_SECRET
-EOF
+ENV_FILE="$INSTALL_DIR/cppm/.env"
+# >>> spoke-env (tests/test_install_env.py runs this block on its own)
+# The whole read-modify-write of .env runs as svc_lm, not root, while holding
+# the flock on the sidecar .env.lock that the running spoke also takes when it
+# rotates SPOKE_SECRET/HUB_SECRET into this file (core
+# control_plane._env_file_flock). The service keeps running until the restart
+# below, so without the lock a rotation landing between the read and the write
+# was overwritten with the stale value. Running as svc_lm matters because the
+# directory belongs to svc_lm: a root installer opening, chowning or chmodding
+# a path there would follow a symlink planted by a compromised service account
+# onto any root-owned file. As svc_lm, a planted symlink reaches only what
+# svc_lm can already reach, and mktemp creates the new .env owned by svc_lm,
+# mode 0600, so root never chowns or chmods anything here. runuser and flock
+# are both in util-linux. The values are passed in the environment of this one
+# subshell only, never on a command line.
+(
+export ENV_FILE HUB_URL HUB_URL_GIVEN SPOKE_ID SPOKE_SECRET SPOKE_SECRET_GIVEN HUB_SECRET HUB_SECRET_GIVEN
+runuser -u svc_lm -- flock "$ENV_FILE.lock" bash -e <<'SPOKE_ENV'
+# env_get KEY: KEY's value in the existing .env, or "" when absent.
+env_get() {
+    [ -f "$ENV_FILE" ] && grep "^$1=" "$ENV_FILE" | tail -n 1 | cut -d= -f2- || true
+}
+# env_set KEY VALUE: replace KEY's line (or add it) and keep every other line,
+# so settings added by hand (CPPM_HOST, LM_CPPM_VERIFY_TLS, ...) and keys the
+# spoke persists itself survive a re-run. The new file is made by mktemp
+# (mode 0600) and renamed into place, so the secrets are never readable by
+# other users, even briefly.
+env_set() {
+    local tmp
+    tmp="$(mktemp "$ENV_FILE.XXXXXX")"
+    { [ -f "$ENV_FILE" ] && grep -v "^$1=" "$ENV_FILE" || true; printf '%s=%s\n' "$1" "$2"; } > "$tmp"
+    mv -f "$tmp" "$ENV_FILE"
+}
+# A value given on this run wins; otherwise keep the one already in .env, so a
+# re-run without flags (a code update) keeps the secrets and the hub.
+[ -n "$HUB_URL_GIVEN" ]      || HUB_URL="$(env_get HUB_URL)"
+[ -n "$SPOKE_SECRET_GIVEN" ] || SPOKE_SECRET="$(env_get SPOKE_SECRET)"
+[ -n "$HUB_SECRET_GIVEN" ]   || HUB_SECRET="$(env_get HUB_SECRET)"
+HUB_URL="${HUB_URL:-auto}"
+if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lm-secret" ]; then
+    # Keep the default PSK "lm-secret" (do NOT clear to "") so the =-attached
+    # ExecStart below (--secret=$SPOKE_SECRET) resolves to "lm-secret" at
+    # runtime — matching the prior bare `--secret` argparse const="lm-secret"
+    # zero-touch behavior. Clearing to "" would make `--secret=` pass an empty
+    # string (pending negotiation) instead of the default-PSK path.
+    SPOKE_SECRET="lm-secret"
+    echo "ℹ️  No pre-shared secret — spoke will connect with the default PSK 'lm-secret' (zero-touch; the hub auto-approves the default PSK or awaits admin approval in the LM WebUI)."
+fi
+env_set HUB_URL "$HUB_URL"
+env_set SPOKE_ID "$SPOKE_ID"
+env_set SPOKE_SECRET "$SPOKE_SECRET"
+# The unit passes --hub-secret=$HUB_SECRET from this file; before, the value
+# was never written, so --hub-secret was silently dropped.
+env_set HUB_SECRET "$HUB_SECRET"
+# Report the hub from here: a re-run without --hub keeps the .env value, which
+# only this block knows (the parent shell still holds "auto").
+echo "🌐 Hub Target: $HUB_URL"
+SPOKE_ENV
+)
+# <<< spoke-env
 
 # --- Systemd Service (For Remote/Independent Deployment) ---
 echo "⚙️ Creating systemd service for auto-start..."
@@ -225,6 +285,5 @@ systemctl enable lm-cppm
 systemctl restart lm-cppm
 
 echo "🎉 CPPM Manager installation complete!"
-echo "🌐 Hub Target: $HUB_URL"
 echo "🆔 Spoke ID: $SPOKE_ID"
 echo "📦 Version: $(cat VERSION 2>/dev/null || echo unknown)"
