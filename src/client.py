@@ -389,8 +389,17 @@ class CPPMClient:
                     return {"status": "ERROR",
                             "message": f"Empty response from CPPM (HTTP {response.status_code})"}
                 return {"status": "SUCCESS"}
-            # Return the decoded JSON body.
-            return response.json()
+            # Return the decoded JSON body. Only the decode is in this try, so
+            # a ValueError here is a bad body, never an InvalidURL or
+            # MissingSchema from the send. Every requests release raises a
+            # ValueError for one: its own JSONDecodeError from 2.27 (also a
+            # RequestException, so the outer branch would take it first),
+            # the json or simplejson one before that.
+            try:
+                return response.json()
+            except ValueError:
+                logger.error("Non-JSON response for %s %s", method, url)
+                return {"status": "ERROR", "message": "Non-JSON response from CPPM"}
         except requests.exceptions.HTTPError as e:
             # ClearPass returns the *why* (validation failures, missing fields)
             # in the response body — e.g. a 422 names the offending attribute.
@@ -441,9 +450,6 @@ class CPPMClient:
             # Other transport failures (timeouts, refused connections): log and report.
             logger.error(f"Request failed for {method} {url}: {e}")
             return {"status": "ERROR", "message": str(e)}
-        # The response body was not valid JSON.
-        except ValueError:
-            return {"status": "ERROR", "message": "Non-JSON response from CPPM"}
 
     def query(self, endpoint: str, params: Optional[Dict] = None) -> Dict[str, Any]:
         """Perform a GET query against ClearPass REST API with optional query parameters."""

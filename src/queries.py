@@ -318,6 +318,11 @@ def _ca_certs_to_trust(fullchain: str, chain: str) -> list:
     return cas
 
 
+def _is_error(reply: Any) -> bool:
+    """True when a CPPMClient reply is its ERROR envelope."""
+    return isinstance(reply, dict) and reply.get("status") == "ERROR"
+
+
 def _cert_subject_cn(pem: str) -> str:
     """Best-effort Common Name from a PEM cert, for idempotency matching +
     diagnostics. Returns ``""`` on any parse failure (the caller treats an
@@ -2368,10 +2373,15 @@ class CPPMQueries:
             return []
 
         # One GET to index existing CTL entries by subject CN (best-effort —
-        # the list item's CN field name isn't documented, so try several).
+        # the list item's CN field name isn't documented, so try several),
+        # keeping each entry's id and the enabled state the GET reported.
         existing: Dict[str, Any] = {}
+        was_enabled: Dict[str, Optional[bool]] = {}
         try:
             lst = self.client.query("/api/cert-trust-list")
+            if _is_error(lst):
+                logger.warning("trust-list GET failed (%s) — proceeding with blind "
+                               "POST (no idempotency index)", lst.get("message"))
             for it in self._items(lst):
                 if not isinstance(it, dict):
                     continue
@@ -2380,6 +2390,8 @@ class CPPMQueries:
                 cn = str(cn).strip() if cn else ""
                 if cn:
                     existing[cn] = it.get("id")
+                    en = it.get("enabled")
+                    was_enabled[cn] = en if isinstance(en, bool) else None
         except Exception as e:
             logger.warning("trust-list GET failed (%s) — proceeding with blind "
                            "POST (no idempotency index)", e)
@@ -2391,18 +2403,38 @@ class CPPMQueries:
             cn = _cert_subject_cn(pem) or "<unknown>"
             if cn in existing:
                 # Already trusted — ensure it's enabled (PATCH), don't re-POST.
+                # "already-trusted" means present AND enabled by this PATCH;
+                # a failed or unsent enable gets its own action, because the
+                # PUT's 422 needs the CA enabled, not just present.
                 tid = existing.get(cn)
-                enabled = True
+                entry = {"ca": cn, "action": "already-trusted", "enabled": True}
                 if tid is not None:
+                    # _request reports most failures as an ERROR dict rather
+                    # than raising, so the reply is checked as well.
                     try:
-                        self.client._request(
+                        r = self.client._request(
                             "PATCH", f"/api/cert-trust-list/{tid}",
                             json={"enabled": True})
+                        failure = None
+                        if _is_error(r):
+                            failure = str(r.get("message") or "ClearPass API error")
+                        elif not isinstance(r, (dict, list)):
+                            failure = "no JSON reply"
                     except Exception as e:
-                        enabled = False
-                        logger.warning("trust-list PATCH-enable %s failed: %s", cn, e)
-                results.append({"ca": cn, "action": "already-trusted",
-                                "enabled": enabled})
+                        failure = str(e)
+                    # The enable failed: say so, so the PUT's 422 is explained.
+                    # The entry keeps the state the GET reported (None when
+                    # the GET did not say): a failed PATCH changes nothing.
+                    if failure is not None:
+                        logger.warning("trust-list PATCH-enable %s failed: %s", cn, failure)
+                        entry.update(action="enable-failed", enabled=was_enabled.get(cn),
+                                     message=f"enable failed: {failure}"[:160])
+                else:
+                    # No id to PATCH: report the state the GET reported, if any.
+                    logger.warning("trust-list entry %s has no id; enable not attempted", cn)
+                    entry.update(action="enable-not-attempted", enabled=was_enabled.get(cn),
+                                 message="entry has no id; enable not attempted")
+                results.append(entry)
                 continue
             # Not yet trusted: POST it to the trust list as enabled.
             try:
@@ -2416,19 +2448,26 @@ class CPPMQueries:
                 results.append({"ca": cn, "action": "error",
                                 "message": str(e)[:160]})
                 continue
-            # Pull status and message out of the response.
-            st = (r or {}).get("status", "ERROR") if isinstance(r, dict) else "ERROR"
-            msg = str((r or {}).get("message", "") or "") if isinstance(r, dict) else ""
-            # A duplicate/conflict (CA already trusted under a usage we didn't
-            # match) is fine — the CA is present, which is all the PUT requires.
+            # A created entry comes back as the object itself (no "status"),
+            # so only an ERROR dict or a non-JSON reply is a failure.
+            st = "ERROR" if _is_error(r) or not isinstance(r, (dict, list)) else "SUCCESS"
+            msg = str(r.get("message", "") or "") if isinstance(r, dict) else ""
+            # A duplicate/conflict: the CA is present under an entry the GET
+            # did not match, so no id to enable and its state is unknown. Not
+            # an error, but not confirmed enabled either.
             low = msg.lower()
             if st == "ERROR" and any(k in low for k in
                                      ("exist", "duplicate", "already")):
-                results.append({"ca": cn, "action": "already-trusted"})
+                logger.warning("trust-list POST %s: already present; enable not attempted", cn)
+                results.append({"ca": cn, "action": "enable-not-attempted", "enabled": None,
+                                "message": f"already present ({msg}); enable not attempted"[:160]})
+            elif st == "ERROR":
+                # Any other failure is an error, never "added".
+                logger.warning("trust-list POST %s failed: %s", cn, msg or "no JSON reply")
+                results.append({"ca": cn, "action": "error",
+                                "message": (msg or "no JSON reply")[:160]})
             else:
-                # Any other response is recorded as "added" with its status and message.
-                results.append({"ca": cn, "action": "added", "status": st,
-                                "message": msg[:160]})
+                results.append({"ca": cn, "action": "added", "status": st})
         # Per-CA outcomes for the caller's log/response.
         return results
 

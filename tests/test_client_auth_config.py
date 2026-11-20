@@ -13,6 +13,7 @@
 import asyncio
 
 import pytest
+import json
 import requests
 
 from src.client import CPPMClient, _https_base
@@ -279,3 +280,42 @@ def test_an_empty_network_device_page_aborts_the_nad_sync():
     res = CPPMQueries(client).sync_network_devices("dxp", "DXP", ["10.0.0.0/8"], radius_secret="r")
     assert res["status"] == "ERROR"
     assert [m for m, _, _ in client.session.requests if m != "GET"] == []
+
+
+def test_a_non_json_200_body_is_reported_as_non_json():
+    """requests' JSONDecodeError is also a RequestException, so the earlier
+    transport branch used to swallow it with the bare decoder message."""
+    client = CPPMClient(host="cppm.lab", client_id="lm", client_secret="s")
+    client.session = _FakeSession(["t1"], [_resp(200, "<html>login</html>")])
+    assert client.query("/api/endpoint") == {
+        "status": "ERROR", "message": "Non-JSON response from CPPM"}
+
+
+@pytest.mark.parametrize("decode_error", [
+    json.JSONDecodeError("Expecting value", "<html>", 0),
+    ValueError("No JSON object could be decoded")])
+def test_a_non_json_body_is_non_json_on_any_requests_release(monkeypatch, decode_error):
+    """Before 2.27 requests raised the json module's (or simplejson's) error,
+    which has no requests.exceptions.JSONDecodeError to match: still a
+    Non-JSON ERROR, never an uncaught exception."""
+    client = CPPMClient(host="cppm.lab", client_id="lm", client_secret="s")
+    client.session = _FakeSession(["t1"], [_resp(200, "<html>login</html>")])
+
+    def old_json(self, **kw):
+        raise decode_error
+    monkeypatch.setattr(requests.Response, "json", old_json)
+    monkeypatch.delattr(requests.exceptions, "JSONDecodeError", raising=False)
+    assert client.query("/api/endpoint") == {
+        "status": "ERROR", "message": "Non-JSON response from CPPM"}
+
+
+def test_an_invalid_url_is_not_reported_as_non_json():
+    """InvalidURL is a ValueError too; it must stay a transport error."""
+    client = CPPMClient(host="cppm.lab", client_id="lm", client_secret="s")
+
+    class _Bad(_FakeSession):
+        def request(self, *a, **kw):
+            raise requests.exceptions.InvalidURL("bad url")
+    client.session = _Bad(["t1"], [])
+    res = client.query("/api/endpoint")
+    assert res["status"] == "ERROR" and res["message"] == "bad url"
