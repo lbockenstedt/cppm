@@ -44,6 +44,24 @@ def _nas_name(s: dict) -> str:
             or s.get("nasipaddress") or "")
 
 
+def _calling_station(s: dict) -> str:
+    """Caller (endpoint) MAC as ClearPass reports it on a ``/api/session`` record.
+
+    ``callingstationid`` is the confirmed field (it is also the only one
+    ``/api/session`` can filter on); some ClearPass versions and older code use
+    ``callingstation``. Reading only ``callingstation`` returned an empty MAC
+    for every session on an appliance that sends ``callingstationid``."""
+    # Prefer the confirmed field, then the older spelling.
+    return s.get("callingstationid") or s.get("callingstation") or ""
+
+
+def _session_mac(s: dict) -> str:
+    """Endpoint MAC for a ``/api/session`` record: the calling station, or a
+    plain ``mac`` key when the record carries no calling station."""
+    # Calling-station fields first, then the generic key.
+    return _calling_station(s) or s.get("mac") or ""
+
+
 def _nas_port(s: dict) -> str:
     """NAS port identifier for a ClearPass ``/api/session`` record.
 
@@ -413,9 +431,9 @@ class CPPMQueries:
             sessions.append({
                 "id":               s.get("id", ""),
                 "username":         s.get("username", ""),
-                "mac":              s.get("callingstation", s.get("mac", "")),
+                "mac":              _session_mac(s),
                 "ip":               s.get("framedipaddress", ""),
-                "calling_station":  s.get("callingstation", ""),
+                "calling_station":  _calling_station(s),
                 "nas_name":         _nas_name(s),
                 "nas_port":         _nas_port(s),
                 "nas_port_type":    _nas_port_type(s),
@@ -550,7 +568,7 @@ class CPPMQueries:
             # Normalise each session that has a MAC address.
             items = self._items(result)
             for s in items:
-                mac = s.get("callingstation", s.get("mac", ""))
+                mac = _session_mac(s)
                 if not mac:
                     continue  # MAC-keyed downstream; nothing to ingest without one
                 # Keep only the fields the NetBox sink needs.
@@ -1081,11 +1099,8 @@ class CPPMQueries:
                 ip = (s.get("framedipaddress") or "").strip()
                 if not ip or ip not in wanted or ip in resolved:
                     continue
-                # ``callingstationid`` is the confirmed /api/session field for
-                # the caller (endpoint) MAC; some ClearPass versions / the older
-                # access-tracker code use ``callingstation`` / a ``mac`` key, so
-                # accept all three.
-                mac_raw = s.get("callingstationid") or s.get("callingstation") or s.get("mac") or ""
+                # The session's endpoint MAC, whichever field carries it.
+                mac_raw = _session_mac(s)
                 # Keep the normalised MAC for this IP when the session carried one.
                 mac = self._norm_mac(mac_raw)
                 if mac:
@@ -1656,9 +1671,7 @@ class CPPMQueries:
                     break
                 # Compare each session's MAC (hex only) with the requested one.
                 for s in page_items:
-                    s_hex = re.sub(r"[^0-9a-f]", "",
-                                   (s.get("callingstationid")
-                                    or s.get("callingstation") or "").lower())
+                    s_hex = re.sub(r"[^0-9a-f]", "", _calling_station(s).lower())
                     if mac_hex and s_hex == mac_hex:
                         items.append(s)
                         if len(items) >= limit:
@@ -1905,10 +1918,11 @@ class CPPMQueries:
                     break
                 # Text fields to search: username, IP, MAC and NAS name.
                 for s in items:
+                    smac_raw = _calling_station(s)
                     fields = [
                         s.get("username", ""),
                         s.get("framedipaddress", ""),
-                        s.get("callingstation", ""),
+                        smac_raw,
                         _nas_name(s),
                     ]
                     # Role names are searchable too.
@@ -1921,14 +1935,14 @@ class CPPMQueries:
                         # Separator-insensitive MAC match for callingstation.
                         q_hex = re.sub(r"[^0-9a-f]", "", q)
                         if q_hex:
-                            mac_hex = re.sub(r"[^0-9a-f]", "", (s.get("callingstation") or "").lower())
+                            mac_hex = re.sub(r"[^0-9a-f]", "", smac_raw.lower())
                             matched = q_hex in mac_hex
                     # Skip sessions that matched nothing.
                     if not matched:
                         continue
                     # Resolve the session's tenant by joining to its endpoint
                     # (sessions carry no tenant attribute of their own).
-                    smac = self._norm_mac(s.get("callingstation", ""))
+                    smac = self._norm_mac(smac_raw)
                     stenant = mac_to_tenant.get(smac, "")
                     if scoped and stenant != tenant_id:
                         # No endpoint, or endpoint's tenant doesn't match → drop
@@ -1940,7 +1954,7 @@ class CPPMQueries:
                         "type":     "session",
                         "name":     s.get("username", ""),
                         "ip":       s.get("framedipaddress", ""),
-                        "mac":      s.get("callingstation", ""),
+                        "mac":      smac_raw,
                         "nas":      _nas_name(s),
                         "role":     (roles or [""])[0] if isinstance(roles, list) else s.get("role", ""),
                         "tenant":   stenant,

@@ -360,3 +360,42 @@ def test_get_nac_status_all_failed_returns_the_first_error(queries, mock_client)
 def test_get_nac_status_no_counts_at_all_is_an_error(queries, mock_client):
     mock_client.query.return_value = {"_embedded": {"items": []}}
     assert queries.get_nac_status() == {"status": "ERROR", "message": "ClearPass returned no counts"}
+
+
+# ── session MAC field: callingstationid (confirmed) or callingstation ───────
+
+_MAC_FIELDS = ["callingstationid", "callingstation"]
+
+
+@pytest.mark.parametrize("field", _MAC_FIELDS)
+def test_session_readers_take_the_mac_from_either_calling_station_field(queries, mock_client, field):
+    """ClearPass sends ``callingstationid``; older versions ``callingstation``.
+    The access tracker and the realtime reverse-sync pull read either."""
+    mock_client.query.return_value = {"count": 1, "_embedded": {"items": [{
+        "id": 7, "username": "alice", field: "AA:BB:CC:DD:EE:01",
+        "framedipaddress": "10.0.0.5", "acctstarttime": "2026-07-01 10:00:00"}]}}
+
+    tracker = queries.get_access_tracker()["sessions"][0]
+    assert tracker["mac"] == tracker["calling_station"] == "AA:BB:CC:DD:EE:01"
+    recent = queries.get_recent_sessions(lookback_minutes=2)["sessions"]
+    assert [s["mac"] for s in recent] == ["AA:BB:CC:DD:EE:01"]
+
+
+@pytest.mark.parametrize("field", _MAC_FIELDS)
+def test_search_finds_and_scopes_a_session_by_either_calling_station_field(queries, mock_client, field):
+    """A scoped search matches the session by MAC, returns the MAC, and joins
+    it to its endpoint's tenant (an empty MAC would drop it for a tenant)."""
+    endpoint = {"id": 1, "mac_address": "aabbccddee01",
+                "attributes": {"NetBox_Tenant_ID": "lrb"}}
+    session = {"id": 9, "username": "alice", field: "AA:BB:CC:DD:EE:01",
+               "framedipaddress": "10.0.0.5"}
+
+    def query_side(path, params=None):
+        if path == "/api/session":
+            return {"count": 1, "_embedded": {"items": [session]}}
+        return {"count": 1, "_embedded": {"items": [endpoint]}}
+
+    mock_client.query.side_effect = query_side
+    res = queries.search("aa-bb-cc-dd-ee-01", tenant_id="lrb")
+    sessions = [r for r in res["results"] if r["type"] == "session"]
+    assert [(r["mac"], r["tenant"]) for r in sessions] == [("AA:BB:CC:DD:EE:01", "lrb")]
