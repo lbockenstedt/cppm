@@ -10,7 +10,7 @@ import asyncio
 from typing import Any, Dict
 # High-level ClearPass queries and the low-level REST client they use.
 from queries import CPPMQueries
-from client import CPPMClient, auth_failure_hint
+from client import CPPMClient, _https_base, auth_failure_hint
 # os locates the VERSION file; logging records commands; time drives cache expiry.
 import os
 import logging
@@ -71,6 +71,10 @@ class CPPMSpoke:
         # page can't be handed back indefinitely between refreshes.
         self._cache_ts: Dict[str, float] = {}
         self._cache_ttl = 60.0
+        # Bumped whenever the cache is dropped for a new appliance or login, so
+        # a refresh that started before the switch cannot store the old
+        # appliance's results afterwards.
+        self._cache_gen = 0
 
     def get_version(self) -> str:
         """Read and return semantic version string from local VERSION file."""
@@ -98,12 +102,13 @@ class CPPMSpoke:
         A successful reply is reduced to _TOKEN_REPLY_FIELDS: the access token
         is a live ClearPass admin credential and must not reach the browser.
         """
-        # Per-attempt results and the client whose settings are being tested.
+        # Per-attempt results and the one configuration being tested. Taken
+        # once, so an UPDATE_CONFIG while this runs cannot send one
+        # appliance's credentials to the other appliance's URL.
         results = []
-        client = self.client
-        base = client._base_url()
-        # Reuse the client's long-lived keep-alive Session rather than a fresh
-        # requests.Session per run; it carries the TLS verify setting.
+        client = self.client._conn
+        base = _https_base(client.host)
+        # Reuse that configuration's keep-alive Session; it carries its TLS verify setting.
         session = client.session
         # Build the same candidate grants the client would use, client_credentials first.
         candidates = []
@@ -158,15 +163,21 @@ class CPPMSpoke:
             "CPPM_GET_DEVICE_DATABASE": self.queries.get_device_database,
             "CPPM_GET_NAC_STATUS": self.queries.get_nac_status,
         }
-        # Per-command outcome reported back to the caller.
+        # Per-command outcome reported back to the caller, and the cache
+        # generation this refresh belongs to.
         results = {}
+        gen = self._cache_gen
         # Refresh each command independently so one failure does not block the others.
         for cmd, method in refresh_map.items():
             try:
                 # Run the blocking query in a worker thread.
                 res = await asyncio.get_event_loop().run_in_executor(None, method)
+                # The config changed while this ran: the result is the old
+                # appliance's, so it is not cached.
+                if gen != self._cache_gen:
+                    results[cmd] = "Skipped: config changed during refresh"
                 # Cache successful results with the time they were fetched.
-                if isinstance(res, dict) and res.get("status") == "SUCCESS":
+                elif isinstance(res, dict) and res.get("status") == "SUCCESS":
                     self._cache[cmd] = res
                     self._cache_ts[cmd] = time.time()
                     results[cmd] = "OK"
@@ -201,6 +212,7 @@ class CPPMSpoke:
             if not host:
                 return {"status": "ERROR", "message": "Missing 'host'"}
             # Store the new config and reconfigure the client in place.
+            prev = self.client._conn.identity()
             self.config = data
             self.client.update_config(
                 host=host,
@@ -210,6 +222,17 @@ class CPPMSpoke:
                 client_secret=data.get("client_secret", ""),
                 verify_ssl=data.get("verify_ssl"),
             )
+            # A different appliance or login sees different data: drop the
+            # dashboard cache so the old one's results are not served for up
+            # to the TTL, and bump the generation so a refresh still running
+            # under the old login does not store its result. Any credential
+            # counts: dropping the password alone moves the client from the
+            # password grant to client_credentials, another principal. An
+            # identical re-push (e.g. on reconnect) keeps the cache.
+            if prev != self.client._conn.identity():
+                self._cache.clear()
+                self._cache_ts.clear()
+                self._cache_gen += 1
             # Confirm the reconfiguration.
             return {"status": "SUCCESS", "message": f"Config updated for host {host}"}
 
