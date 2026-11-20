@@ -399,3 +399,155 @@ def test_search_finds_and_scopes_a_session_by_either_calling_station_field(queri
     res = queries.search("aa-bb-cc-dd-ee-01", tenant_id="lrb")
     sessions = [r for r in res["results"] if r["type"] == "session"]
     assert [(r["mac"], r["tenant"]) for r in sessions] == [("AA:BB:CC:DD:EE:01", "lrb")]
+
+
+# --- A ClearPass ERROR reply is a failure, never "nothing found" ----------
+
+_ERR = {"status": "ERROR", "message": "HTTP 503"}
+
+
+def test_get_device_by_mac_error_raises_instead_of_not_found(queries, mock_client):
+    """A failed MAC lookup must not read as "no such endpoint"."""
+    mock_client.query.return_value = _ERR
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        queries.get_device_by_mac("00:11:22:33:44:55")
+
+
+@pytest.mark.parametrize("call", [
+    lambda q: q.get_user_sessions("alice"),
+    lambda q: q.get_auth_logs("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+])
+def test_session_readers_error_raises_instead_of_empty(queries, mock_client, call):
+    """A failed session query must not read as "no sessions"."""
+    mock_client.query.return_value = _ERR
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        call(queries)
+
+
+def test_list_roles_failed_later_page_raises_instead_of_partial(queries, mock_client):
+    """A page that fails after a full first page must not return a partial list."""
+    full = [{"name": f"r{i}"} for i in range(1000)]
+    mock_client.query.side_effect = [full, _ERR]
+    with pytest.raises(RuntimeError, match="role list failed"):
+        queries.list_roles()
+
+
+def test_get_device_sessions_filter_and_scan_both_failing_is_an_error(queries, mock_client):
+    """When the server filter and the fallback scan both fail, report ERROR, not no sessions."""
+    mock_client.query.side_effect = [
+        {"status": "ERROR", "message": "cannot filter using 'callingstationid'"},
+        _ERR,
+    ]
+    res = queries.get_device_sessions("aabbccddee01", limit=20)
+    assert res["status"] == "ERROR"
+    assert "HTTP 503" in res["message"]
+
+
+@pytest.mark.parametrize("cmd,data", [
+    ("GET_DEVICE", {"mac": "00:11:22:33:44:55"}),
+    ("GET_USER_SESSIONS", {"username": "alice"}),
+    ("GET_LOGS", {"start": "2026-01-01T00:00:00Z", "end": "2026-01-02T00:00:00Z"}),
+    ("LIST_ROLES", {}),
+])
+def test_spoke_reports_clearpass_error_not_empty_success(cmd, data):
+    """The spoke handlers return ERROR (with the cause), not SUCCESS/"not found"."""
+    import asyncio
+    from src.spoke import CPPMSpoke
+    spoke = CPPMSpoke("cppm-1", {})
+    spoke.queries.client = MagicMock(spec=CPPMClient)
+    spoke.queries.client.query.return_value = _ERR
+    res = asyncio.new_event_loop().run_until_complete(spoke.handle_command(cmd, data))
+    assert res["status"] == "ERROR"
+    assert "HTTP 503" in res["message"]
+
+
+def test_sync_does_not_create_when_the_mac_lookup_fails(queries, mock_client):
+    """A failed MAC lookup counts as an error; it must not POST a new endpoint."""
+    mock_client.query.return_value = _ERR
+    res = queries.sync_endpoints(
+        tenant_id="lrb", tenant_name="LRB", source="NetBox", replace=False,
+        endpoints=[{"ip": "172.16.1.62", "mac": "AA-BB-CC-DD-EE-FF", "hostname": "ws-01"}])
+    assert res["status"] == "ERROR"
+    assert res.get("pushed", 0) == 0
+    assert not [c for c in mock_client._request.call_args_list
+                if c.args[:2] == ("POST", "/api/endpoint")]
+
+
+@pytest.mark.parametrize("failing", ["/api/endpoint", "/api/session"])
+def test_search_keeps_the_other_legs_matches_with_an_error_row(queries, mock_client, failing):
+    """One failed scan does not throw away the other scan's matches: they come
+    back with an error row naming the failed scan, so the hub's global search
+    shows them and marks the NAC leg degraded instead of "no matches"."""
+    endpoint = {"id": 1, "mac_address": "aabbccddee01", "attributes": {}}
+    session = {"id": "s1", "username": "aabbcc-user", "callingstationid": "AABBCCDDEE01"}
+
+    def query_side(path, params=None):
+        if "filter" in (params or {}):
+            return {"count": 0, "_embedded": {"items": []}}
+        if path == failing:
+            return _ERR
+        if path == "/api/session":
+            return {"count": 1, "_embedded": {"items": [session]}}
+        return {"count": 1, "_embedded": {"items": [endpoint]}}
+
+    mock_client.query.side_effect = query_side
+    res = queries.search("aabbcc", is_admin=True)
+    assert res["status"] == "SUCCESS" and res["count"] == 1
+    kept = "session" if failing == "/api/endpoint" else "endpoint"
+    assert [r["type"] for r in res["results"]] == [kept, "error"]
+    leg = "endpoint" if failing == "/api/endpoint" else "session"
+    assert res["results"][-1]["name"].startswith(f"{leg} search:")
+    assert "HTTP 503" in res["results"][-1]["name"]
+
+
+@pytest.mark.parametrize("bad", [_ERR, None, 7])
+def test_search_with_failed_scans_and_no_match_is_an_error(queries, mock_client, bad):
+    """Failed scans with nothing found to show: ERROR naming both scans, not
+    an empty SUCCESS that reads as "no matches"."""
+    mock_client.query.side_effect = lambda path, params=None: (
+        bad if "offset" in (params or {}) else {"count": 0, "_embedded": {"items": []}})
+    res = queries.search("aabbcc", is_admin=True)
+    assert res["status"] == "ERROR"
+    assert "endpoint search:" in res["message"] and "session search:" in res["message"]
+
+
+@pytest.mark.parametrize("body", [None, 0, "oops"])
+@pytest.mark.parametrize("call", [
+    lambda q: q.get_device_by_mac("00:11:22:33:44:55"),
+    lambda q: q.get_user_sessions("alice"),
+    lambda q: q.get_auth_logs("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+    lambda q: q.list_roles(),
+], ids=["device", "user-sessions", "auth-logs", "roles"])
+def test_readers_fail_on_a_json_body_that_is_not_an_object_or_list(queries, mock_client, call, body):
+    """A JSON null, number or string is not an empty result: the readers raise."""
+    mock_client.query.return_value = body
+    with pytest.raises(RuntimeError, match="no JSON object or list"):
+        call(queries)
+
+
+@pytest.mark.parametrize("filter_reply", [None, {"status": "ERROR", "message": "422"}])
+def test_get_device_sessions_null_bodies_are_an_error_not_no_sessions(queries, mock_client, filter_reply):
+    """A null filter reply falls back to the scan like a rejected filter, and
+    a null scan page is a failure, not the end of the session list."""
+    mock_client.query.side_effect = [filter_reply, None]
+    res = queries.get_device_sessions("aabbccddee01", limit=20)
+    assert res["status"] == "ERROR"
+    assert "scan at offset 0: ClearPass returned no JSON object or list" in res["message"]
+
+
+def test_search_rejected_exact_filter_still_returns_scan_matches(queries, mock_client):
+    """A query that is not a MAC/IP may be rejected by the exact filters; the
+    scan still runs and the search succeeds."""
+    endpoint = {"id": 1, "mac_address": "aabbccddee01", "attributes": {"Hostname": "alice-pc"}}
+
+    def query_side(path, params=None):
+        if "filter" in (params or {}):
+            return _ERR
+        if path == "/api/session":
+            return {"count": 0, "_embedded": {"items": []}}
+        return {"count": 1, "_embedded": {"items": [endpoint]}}
+
+    mock_client.query.side_effect = query_side
+    res = queries.search("alice", is_admin=True)
+    assert res["status"] == "SUCCESS"
+    assert [r["type"] for r in res["results"]] == ["endpoint"]

@@ -385,6 +385,30 @@ class CPPMQueries:
         # All API calls go through this client.
         self.client = client
 
+    @staticmethod
+    def _reply_problem(result: Any) -> Optional[str]:
+        """Why a ClearPass read reply is a failure, or None when it is a
+        usable dict or list. An ERROR reply and a JSON body that is neither
+        (``null``, a number, a string) both fail: ``_items`` reads either as
+        an empty list, which would look like "nothing found"."""
+        if isinstance(result, dict) and result.get("status") == "ERROR":
+            return str(result.get("message") or "ClearPass API error")
+        if not isinstance(result, (dict, list)):
+            return "ClearPass returned no JSON object or list"
+        return None
+
+    @staticmethod
+    def _raise_on_error(result: Any, what: str) -> Any:
+        """Return ``result``, or raise RuntimeError when ``_reply_problem``
+        says it is a failure, so a caller never reports a failed ClearPass
+        call as "nothing found". The handlers turn the exception into an
+        ERROR envelope.
+        """
+        problem = CPPMQueries._reply_problem(result)
+        if problem:
+            raise RuntimeError(f"{what} failed: {problem}")
+        return result
+
     def _items(self, result: Any, key: str = "_embedded") -> List[Dict]:
         """Extracts item list from CPPM's HAL-style response."""
         # Dict responses: an error result has no items.
@@ -733,8 +757,11 @@ class CPPMQueries:
 
     def get_device_by_mac(self, mac: str) -> Optional[Dict[str, Any]]:
         """Look up an endpoint record in ClearPass by its MAC address."""
-        # Query endpoints filtered by exact MAC address.
-        result = self.client.query("/api/endpoint", params={"filter": json.dumps({"mac_address": mac}, separators=(",", ":"))})
+        # Query endpoints filtered by exact MAC address; a failed query raises
+        # (it is not "no such endpoint").
+        result = self._raise_on_error(
+            self.client.query("/api/endpoint", params={"filter": json.dumps({"mac_address": mac}, separators=(",", ":"))}),
+            "endpoint lookup by MAC")
         # Return the first match, or None when no endpoint has that MAC.
         items = self._items(result)
         return items[0] if items else None
@@ -1804,7 +1831,8 @@ class CPPMQueries:
         # Try the server-side callingstationid filter first.
         result = _query_filtered("callingstationid", norm) if norm else None
         used_fallback = False
-        if isinstance(result, dict) and result.get("status") == "ERROR":
+        filter_problem = self._reply_problem(result) if norm else None
+        if filter_problem:
             # Server filter rejected (e.g. field not filterable on this ClearPass
             # build) → bounded client-side scan so we still return matches.
             used_fallback = True
@@ -1817,9 +1845,13 @@ class CPPMQueries:
                 # Fetch one page of sessions.
                 r = self.client.query("/api/session", params={
                     "limit": page, "offset": offset, "calculate_count": "true"})
-                # Stop on API error or an empty page.
-                if isinstance(r, dict) and r.get("status") == "ERROR":
-                    break
+                # Both lookups failed: report it, not "no sessions".
+                scan_problem = self._reply_problem(r)
+                if scan_problem:
+                    return {"status": "ERROR", "message": (
+                        f"session lookup failed: filter {filter_problem}; "
+                        f"scan at offset {offset}: {scan_problem}")}
+                # An empty page means there are no more sessions.
                 page_items = self._items(r)
                 if not page_items:
                     break
@@ -1869,9 +1901,10 @@ class CPPMQueries:
 
     def get_user_sessions(self, username: str) -> List[Dict[str, Any]]:
         """Query active and historical sessions associated with a specific username."""
-        # Filter sessions by exact username and return the raw records.
+        # Filter sessions by exact username and return the raw records; a
+        # failed query raises rather than reading as "no sessions".
         result = self.client.query("/api/session", params={"filter": json.dumps({"username": username}, separators=(",", ":"))})
-        return self._items(result)
+        return self._items(self._raise_on_error(result, "user session query"))
 
     def get_auth_logs(self, start_time: str, end_time: str) -> List[Dict[str, Any]]:
         """Retrieve authentication session logs within an ISO timestamp window."""
@@ -1880,8 +1913,9 @@ class CPPMQueries:
             "/api/session",
             params={"filter": json.dumps({"acctstarttime": {"$gte": start_time, "$lte": end_time}}, separators=(",", ":"))},
         )
-        # Return the raw session records.
-        return self._items(result)
+        # Return the raw session records; a failed query raises rather than
+        # reading as "no logs".
+        return self._items(self._raise_on_error(result, "auth log query"))
 
     def _endpoint_search_result(self, ep: Dict[str, Any]) -> Dict[str, Any]:
         """Normalise a ClearPass endpoint into a global-search result."""
@@ -1963,8 +1997,13 @@ class CPPMQueries:
           - `tenant_id` absent + `is_admin` False → empty (never leak another
             tenant's sessions/endpoints).
 
-        Each sub-search (endpoints, sessions) is wrapped in its own try/except
-        so a failure in one doesn't drop the other.
+        A failed ClearPass call in a sub-search (endpoints, sessions) is
+        reported, never read as "no matches": the matches already found are
+        returned with one ``{"type": "error"}`` row per failed sub-search,
+        which the hub's global search shows and marks the leg degraded. With
+        no match to return the reply is ERROR. A failed endpoint scan leaves
+        the session → tenant join incomplete, so a scoped search then drops
+        (never leaks) the sessions it cannot place.
         """
         # Normalise the query; an empty query returns no results.
         q = query.strip().lower()
@@ -1984,6 +2023,8 @@ class CPPMQueries:
         # MAC → NetBox_Tenant_ID map, populated from the endpoint scan so
         # sessions can be joined to a tenant (sessions carry no tenant attr).
         mac_to_tenant: Dict[str, str] = {}
+        # Why each failed sub-search failed; each becomes an error row.
+        failures: List[str] = []
 
         def _ep_tenant(ep: Dict[str, Any]) -> str:
             """Return the tenant id tagged on an endpoint, or "" when untagged."""
@@ -1995,6 +2036,12 @@ class CPPMQueries:
             # Exact endpoint lookup (MAC / IP) — precise & cheap.
             for filter_def in [{"mac_address": q}, {"ip_address": q}]:
                 ep_r = self.client.query("/api/endpoint", params={"filter": json.dumps(filter_def, separators=(",", ":")), "limit": 10})
+                # Best-effort fast path: the query text need not be a valid MAC
+                # or IP, so ClearPass may reject the filter. The substring scan
+                # below covers the same endpoints, and fails the search itself.
+                if isinstance(ep_r, dict) and ep_r.get("status") == "ERROR":
+                    logger.debug("endpoint exact lookup %s failed: %s", list(filter_def), ep_r.get("message"))
+                    continue
                 # Record each match's tenant, apply tenant scoping and de-duplicate by id.
                 for ep in self._items(ep_r):
                     mac = self._norm_mac(ep.get("mac_address", ""))
@@ -2017,10 +2064,8 @@ class CPPMQueries:
                 # Fetch one page of endpoints.
                 ep_r = self.client.query("/api/endpoint", params={
                     "limit": limit, "offset": offset, "calculate_count": "true"})
-                # Paging failure: log and stop the endpoint scan.
-                if isinstance(ep_r, dict) and ep_r.get("status") == "ERROR":
-                    logger.warning("endpoint substring scan failed: %s", ep_r.get("message"))
-                    break
+                # Paging failure: fail the search (handled below).
+                self._raise_on_error(ep_r, "endpoint substring scan")
                 # An empty page means the inventory is exhausted.
                 items = self._items(ep_r)
                 if not items:
@@ -2048,9 +2093,11 @@ class CPPMQueries:
                 offset += limit
                 if len(items) < limit or offset >= count:
                     break
-        # Endpoint search failure is logged so the session search still runs.
+        # Endpoint search failure is recorded; the session search still runs
+        # so its failure (if any) is reported too.
         except Exception as e:
             logger.error(f"CPPM endpoint search failed: {e}")
+            failures.append(f"endpoint search: {e}")
 
         # --- Active sessions (bounded) — substring by IP/MAC/user/NAS ------
         try:
@@ -2062,10 +2109,8 @@ class CPPMQueries:
                 # Fetch one page of sessions.
                 session_r = self.client.query("/api/session", params={
                     "limit": limit, "offset": offset, "calculate_count": "true"})
-                # Paging failure: log and stop the session scan.
-                if isinstance(session_r, dict) and session_r.get("status") == "ERROR":
-                    logger.warning("session substring scan failed: %s", session_r.get("message"))
-                    break
+                # Paging failure: fail the search (handled below).
+                self._raise_on_error(session_r, "session substring scan")
                 # An empty page means there are no more sessions.
                 items = self._items(session_r)
                 if not items:
@@ -2119,9 +2164,14 @@ class CPPMQueries:
                 offset += limit
                 if len(items) < limit or offset >= count:
                     break
-        # Session search failure is logged so endpoint results are still returned.
+        # Session search failure is recorded.
         except Exception as e:
             logger.error(f"CPPM session search failed: {e}")
+            failures.append(f"session search: {e}")
+
+        # A failed sub-search with no match to show: report ERROR, not "no matches".
+        if failures and not results:
+            return {"status": "ERROR", "message": "; ".join(failures)}
 
         # Deduplicate by id
         # Unique results and the keys already seen.
@@ -2133,20 +2183,28 @@ class CPPMQueries:
             if key not in seen:
                 seen.add(key)
                 unique.append(r)
-        # Return the de-duplicated results and their count.
-        return {"status": "SUCCESS", "results": unique, "count": len(unique)}
+        # Return the de-duplicated results and their count, then one error
+        # row per failed sub-search (after the de-duplication, which would
+        # merge them) so the partial result is never taken as complete.
+        count = len(unique)
+        unique.extend({"source": "cppm", "type": "error", "name": f} for f in failures)
+        return {"status": "SUCCESS", "results": unique, "count": count}
 
     def list_roles(self, prefix: str = "") -> List[Dict[str, Any]]:
         """Fetch every ClearPass role, optionally only names starting with ``prefix``.
 
         Pages through /api/role (ClearPass returns a small page by default).
+        A page that fails raises RuntimeError, so a failed or partial list is
+        never returned as the full one.
         """
+        # Accumulated roles and the paging position.
         roles: List[Dict[str, Any]] = []
         offset = 0
         page = 1000
+        # Page through the roles until a short page (or the 50k safety stop).
         while True:
-            items = self._items(self.client.query(
-                "/api/role", params={"limit": page, "offset": offset}))
+            items = self._items(self._raise_on_error(self.client.query(
+                "/api/role", params={"limit": page, "offset": offset}), "role list"))
             roles.extend(items)
             if len(items) < page or offset >= 50000:
                 break
@@ -2559,6 +2617,11 @@ class CPPMQueries:
                                        params={"limit": 1000, "offset": offset})
             if isinstance(res, dict) and res.get("status") == "ERROR":
                 raise RuntimeError(res.get("message") or "network-device list failed")
+            # A JSON body that is not an object or list (e.g. null) would read
+            # as an empty last page and silently end the list early. (The
+            # client already reports a non-JSON or empty GET body as ERROR.)
+            if not isinstance(res, (dict, list)):
+                raise RuntimeError(f"network-device list returned no JSON at offset {offset}")
             # Add this page; a short page means the list is complete.
             page = self._items(res)
             out.extend(page)

@@ -327,8 +327,12 @@ class CPPMSpoke:
             # A MAC is mandatory.
             if not mac:
                 return {"status": "ERROR", "message": "Missing 'mac'"}
-            # Look it up in a worker thread and report found / not found.
-            res = await asyncio.get_event_loop().run_in_executor(None, lambda: self.queries.get_device_by_mac(mac))
+            # Look it up in a worker thread and report found / not found; a
+            # failed lookup reports its own error, not "not found".
+            try:
+                res = await asyncio.get_event_loop().run_in_executor(None, lambda: self.queries.get_device_by_mac(mac))
+            except RuntimeError as e:
+                return {"status": "ERROR", "message": str(e)}
             return {"status": "SUCCESS", "device": res} if res else {"status": "ERROR", "message": "Device not found"}
 
         # LIST_ENDPOINTS: every endpoint in the inventory, paged.
@@ -358,9 +362,13 @@ class CPPMSpoke:
             username = data.get("username")
             if not username:
                 return {"status": "ERROR", "message": "Missing 'username'"}
-            sessions = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.queries.get_user_sessions(username)
-            )
+            # A failed ClearPass query is an ERROR, not an empty list.
+            try:
+                sessions = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.queries.get_user_sessions(username)
+                )
+            except RuntimeError as e:
+                return {"status": "ERROR", "message": str(e)}
             return {"status": "SUCCESS", "sessions": sessions}
 
         # GET_LOGS: authentication sessions within a time window (start and end required).
@@ -369,15 +377,23 @@ class CPPMSpoke:
             end = data.get("end")
             if not start or not end:
                 return {"status": "ERROR", "message": "Missing 'start' or 'end'"}
-            logs = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.queries.get_auth_logs(start, end)
-            )
+            # A failed ClearPass query is an ERROR, not an empty list.
+            try:
+                logs = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.queries.get_auth_logs(start, end)
+                )
+            except RuntimeError as e:
+                return {"status": "ERROR", "message": str(e)}
             return {"status": "SUCCESS", "logs": logs}
 
         # LIST_ROLES: every role defined in ClearPass.
         if normalized == "LIST_ROLES":
-            roles = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.queries.list_roles(data.get("prefix", "")))
+            # A failed page is an ERROR, never a partial role list.
+            try:
+                roles = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.queries.list_roles(data.get("prefix", "")))
+            except RuntimeError as e:
+                return {"status": "ERROR", "message": str(e)}
             return {"status": "SUCCESS", "roles": roles}
 
         # SEARCH_SESSIONS: global substring search, tenant-scoped.

@@ -380,8 +380,14 @@ class CPPMClient:
                     response = conn.session.request(method, url, headers=headers, auth=None, timeout=15, **kwargs)
             response.raise_for_status()
             # Tolerate empty success bodies (e.g. 204 No Content on DELETE) so a
-            # clean delete isn't misreported as a Non-JSON error.
+            # clean delete isn't misreported as a Non-JSON error. A GET always
+            # answers with a JSON body, so an empty one (a proxy, a cut-off
+            # reply) is a failure; as SUCCESS every reader took it for an empty
+            # list or "not found", and a pager for the end of the list.
             if not response.content:
+                if method.upper() == "GET":
+                    return {"status": "ERROR",
+                            "message": f"Empty response from CPPM (HTTP {response.status_code})"}
                 return {"status": "SUCCESS"}
             # Return the decoded JSON body.
             return response.json()

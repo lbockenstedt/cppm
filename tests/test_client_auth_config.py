@@ -256,3 +256,26 @@ def test_test_auth_switch_mid_run_keeps_old_appliance_and_tls_setting(net):
     _assert_no_crossing(net)
     assert {c["host"] for c in net.calls} == {"cppm-a.lab"}
     assert all(c["verify"] is True for c in net.calls)
+
+
+def test_an_empty_get_body_is_an_error_not_an_empty_list():
+    """As SUCCESS, an empty GET body read as "not found" or as the end of a
+    list; only a write may answer with no body (204 on DELETE)."""
+    client = CPPMClient(host="cppm.lab", client_id="lm", client_secret="s")
+    client.session = _FakeSession(["t1"], [_resp(200, ""), _resp(204, "")])
+    res = client.query("/api/endpoint")
+    assert res["status"] == "ERROR" and "Empty response" in res["message"]
+    assert client._request("DELETE", "/api/endpoint/1") == {"status": "SUCCESS"}
+
+
+def test_an_empty_network_device_page_aborts_the_nad_sync():
+    """Through the real client: a full first page then an empty-body page must
+    not end the list (devices on later pages would be re-created)."""
+    from src.queries import CPPMQueries
+    full = '{"_embedded": {"items": [%s]}}' % ",".join(
+        '{"id": %d, "name": "other-%d", "description": ""}' % (i, i) for i in range(1000))
+    client = CPPMClient(host="cppm.lab", client_id="lm", client_secret="s")
+    client.session = _FakeSession(["t1"], [_resp(200, full), _resp(200, "")])
+    res = CPPMQueries(client).sync_network_devices("dxp", "DXP", ["10.0.0.0/8"], radius_secret="r")
+    assert res["status"] == "ERROR"
+    assert [m for m, _, _ in client.session.requests if m != "GET"] == []
