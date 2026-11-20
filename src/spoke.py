@@ -19,21 +19,36 @@ import time
 # One named logger for this spoke.
 logger = logging.getLogger("CPPMSpoke")
 
-# Keys whose values are replaced with asterisks before command data is logged.
-SENSITIVE_KEYS = {'password', 'secret', 'token', 'pass', 'auth_key', 'client_secret',
-                  'radius_secret', 'tacacs_secret'}
+# A key whose name contains any of these is masked before command data is
+# logged. Matched as substrings, not exact names, so a new field such as
+# INSTALL_CERT's ``privkey`` (or ``api_key``, ``hub_secret``) is caught
+# without anyone having to remember to add it here.
+SENSITIVE_KEY_PARTS = ('pass', 'secret', 'token', 'key', 'psk')
+
+
+def _is_sensitive_key(key: Any) -> bool:
+    """True when a dict key names a secret (see SENSITIVE_KEY_PARTS)."""
+    return any(part in str(key).lower() for part in SENSITIVE_KEY_PARTS)
+
 
 def _mask(data: Any) -> Any:
     """Mask sensitive keys such as passwords and secret tokens in logged data."""
-    # Dicts: recurse into nested containers and mask values of sensitive keys.
+    # Dicts: mask the whole value of a sensitive key, recurse into the rest.
     if isinstance(data, dict):
-        return {k: (_mask(v) if isinstance(v, (dict, list)) else ('********' if k.lower() in SENSITIVE_KEYS else v))
-                for k, v in data.items()}
+        return {k: ('********' if _is_sensitive_key(k) else _mask(v)) for k, v in data.items()}
     # Lists: mask each element.
     elif isinstance(data, list):
         return [_mask(item) for item in data]
+    # PEM private key text under any key name is still a secret.
+    if isinstance(data, str) and "PRIVATE KEY" in data:
+        return '********'
     # Plain values are returned unchanged.
     return data
+
+
+# OAuth reply fields TEST_AUTH may show the admin. The reply also carries the
+# access token (and may carry a refresh token), which must not leave the spoke.
+_TOKEN_REPLY_FIELDS = ("token_type", "expires_in", "scope")
 
 class CPPMSpoke:
     """Handles command execution for the CPPM spoke.
@@ -75,6 +90,65 @@ class CPPMSpoke:
         """Runs a synchronous requests-based method in a thread to avoid blocking the event loop."""
         # Wrap the call in a lambda so positional and keyword arguments are preserved.
         return asyncio.get_event_loop().run_in_executor(None, lambda: fn(*args, **kwargs))
+
+    def _test_auth(self) -> Dict[str, Any]:
+        """Try each OAuth grant the configured credentials allow and report how each one went.
+
+        Blocking (one HTTP call per grant), so the caller runs it in a thread.
+        A successful reply is reduced to _TOKEN_REPLY_FIELDS: the access token
+        is a live ClearPass admin credential and must not reach the browser.
+        """
+        # Per-attempt results and the client whose settings are being tested.
+        results = []
+        client = self.client
+        base = client._base_url()
+        # Reuse the client's long-lived keep-alive Session rather than a fresh
+        # requests.Session per run; it carries the TLS verify setting.
+        session = client.session
+        # Build the same candidate grants the client would use, client_credentials first.
+        candidates = []
+        if client.client_id and client.client_secret:
+            candidates.append({"grant_type": "client_credentials",
+                               "client_id": client.client_id,
+                               "client_secret": client.client_secret})
+        # Password grant with each client id, then without a client id.
+        if client.user and client.password:
+            for cid in ([client.client_id] if client.client_id else []) + ["ClearPass"]:
+                body = {"grant_type": "password", "username": client.user, "password": client.password, "client_id": cid}
+                if client.client_secret:
+                    body["client_secret"] = client.client_secret
+                candidates.append(body)
+            candidates.append({"grant_type": "password", "username": client.user, "password": client.password})
+        # Nothing to test without credentials.
+        if not candidates:
+            return {"status": "ERROR", "message": "No credentials configured"}
+        # Attempt each grant and record the HTTP outcome.
+        for body in candidates:
+            label = f"grant={body.get('grant_type')} client_id={body.get('client_id', '<none>')}"
+            try:
+                # Request a token for this grant.
+                resp = session.post(f"{base}/api/oauth", json=body, timeout=10)
+                # Record whether a token came back, with only the non-secret reply fields.
+                if resp.ok:
+                    reply = resp.json()
+                    reply = reply if isinstance(reply, dict) else {}
+                    results.append({"attempt": label,
+                                    "result": "SUCCESS" if reply.get("access_token") else "OK_BUT_NO_TOKEN",
+                                    "detail": {k: reply[k] for k in _TOKEN_REPLY_FIELDS if k in reply}})
+                # Record the HTTP status, a short body excerpt and, when the body
+                # names a known cause, what to do about it.
+                else:
+                    attempt = {"attempt": label, "result": f"HTTP {resp.status_code}",
+                               "detail": resp.text[:300]}
+                    hint = auth_failure_hint(resp.text)
+                    if hint:
+                        attempt["hint"] = hint
+                    results.append(attempt)
+            # Record network/TLS exceptions.
+            except Exception as e:
+                results.append({"attempt": label, "result": "EXCEPTION", "detail": str(e)})
+        # Return every attempt's result.
+        return {"status": "SUCCESS", "auth_attempts": results}
 
     async def refresh_cache(self) -> Dict[str, Any]:
         """Fetch fresh data for cached endpoints (Access Tracker, Device DB, NAC Status)."""
@@ -141,71 +215,28 @@ class CPPMSpoke:
 
         # TEST_AUTH: try every OAuth grant combination and report each outcome (diagnostics).
         if normalized == "TEST_AUTH":
-            # Per-attempt results and the client whose settings are being tested.
-            results = []
-            client = self.client
-            base = client._base_url()
-            # Reuse the client's long-lived keep-alive Session instead of
-            # building a fresh requests.Session (new TCP pool) per TEST_AUTH —
-            # the client session already has verify=False and an OAuth token
-            # path configured; the probe posts grant-specific bodies below.
-            session = client.session
-            # Build the same candidate grants the client would use, client_credentials first.
-            candidates = []
-            if client.client_id and client.client_secret:
-                candidates.append({"grant_type": "client_credentials",
-                                    "client_id": client.client_id,
-                                    "client_secret": client.client_secret})
-            # Password grant with each client id, then without a client id.
-            if client.user and client.password:
-                for cid in ([client.client_id] if client.client_id else []) + ["ClearPass"]:
-                    body = {"grant_type": "password", "username": client.user, "password": client.password, "client_id": cid}
-                    if client.client_secret:
-                        body["client_secret"] = client.client_secret
-                    candidates.append(body)
-                candidates.append({"grant_type": "password", "username": client.user, "password": client.password})
-            # Nothing to test without credentials.
-            if not candidates:
-                return {"status": "ERROR", "message": "No credentials configured"}
-            # Attempt each grant and record the HTTP outcome.
-            for body in candidates:
-                label = f"grant={body.get('grant_type')} client_id={body.get('client_id', '<none>')}"
-                try:
-                    # Request a token for this grant.
-                    resp = session.post(f"{base}/api/oauth", json=body, timeout=10)
-                    # Record whether a token came back, plus the full response for inspection.
-                    if resp.ok:
-                        token = resp.json().get("access_token")
-                        results.append({"attempt": label, "result": "SUCCESS" if token else "OK_BUT_NO_TOKEN",
-                                        "detail": resp.json()})
-                    # Record the HTTP status, a short body excerpt and, when the body
-                    # names a known cause, what to do about it.
-                    else:
-                        attempt = {"attempt": label, "result": f"HTTP {resp.status_code}",
-                                   "detail": resp.text[:300]}
-                        hint = auth_failure_hint(resp.text)
-                        if hint:
-                            attempt["hint"] = hint
-                        results.append(attempt)
-                # Record network/TLS exceptions.
-                except Exception as e:
-                    results.append({"attempt": label, "result": "EXCEPTION", "detail": str(e)})
-            # Return every attempt's result.
-            return {"status": "SUCCESS", "auth_attempts": results}
+            # The attempts make blocking HTTP calls (up to 10s each), so run them
+            # in a worker thread to keep the hub WebSocket loop responsive.
+            return await asyncio.to_thread(self._test_auth)
 
-        # PROBE_API: send an arbitrary request to ClearPass (debugging aid).
+        # PROBE_API: send a read-only request to ClearPass (debugging aid).
         if normalized == "PROBE_API":
-            # Read the path, HTTP method and optional JSON payload.
+            # Read the path and HTTP method.
             path = data.get("path")
-            method = data.get("method", "GET").upper()
-            payload = data.get("payload", {})
+            method = str(data.get("method") or "GET").upper()
             # A path is mandatory.
             if not path:
                 return {"status": "ERROR", "message": "Missing path for PROBE_API"}
+            # Only GET is relayed. The probe acts with the spoke's ClearPass
+            # admin credentials, so a write or delete here would change the
+            # appliance from a debug tool; the WebUI only ever reads.
+            if method != "GET":
+                return {"status": "ERROR",
+                        "message": f"PROBE_API is read-only: method {method} is not allowed (GET only)"}
             # Run the request in a worker thread and return the raw result.
             try:
                 res = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: self.client._request(method, path, json=payload or None)
+                    None, lambda: self.client._request("GET", path)
                 )
                 return res
             # Report any exception as an error result.
