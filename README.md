@@ -124,5 +124,7 @@ curl -sSL https://raw.githubusercontent.com/lbockenstedt/cppm/main/install.sh \
 | `--hub-secret` | Hub PSK for auto-approval. Without it the spoke lands in *pending approval* in the WebUI. |
 | `--all-prereqs` | Accepted and ignored — kept so the hub's install-module call doesn't abort. |
 
+**Re-running:** a value given as a flag replaces the one in `.env`. `--hub`, `--secret` and `--hub-secret` left out keep the value already in `.env`, and lines added by hand (`CPPM_HOST`, `LM_CPPM_VERIFY_TLS`, …) are kept. The id is set again from `--id` or the hostname on every run. `.env` is owned by `svc_lm` with mode `0600`; the installer creates the `svc_lm` user when it is missing. The installer updates `.env` as `svc_lm`, holding the same `.env.lock` the running spoke takes when it rotates a secret, so a secret rotated during the re-run is kept.
+
 **Environment overrides:** `HUB_URL` (same normalization as `--hub`), `SPOKE_ID`.
 <!-- INSTALLERS:END -->
