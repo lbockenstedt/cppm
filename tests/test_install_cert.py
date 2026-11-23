@@ -20,17 +20,15 @@ from src.queries import CPPMQueries
 
 
 # ── Real self-signed cert+key so the modern PKCS12 builder (cryptography)
-# validates the PEM end-to-end. Skips the suite if cryptography isn't
-# installed (the spoke host has it; CI should too). ────────────────────────
+# validates the PEM end-to-end. cryptography is in requirements.txt, so CI
+# and every spoke venv have it. ──────────────────────────────────────────────
 def _real_pair():
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        from cryptography.x509.oid import NameOID
-        import datetime
-    except Exception:
-        pytest.skip("cryptography not installed")
+    # cryptography is a declared requirement: a missing install fails, never skips.
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    import datetime
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "lm-test")])
     now = datetime.datetime.utcnow()
@@ -294,14 +292,12 @@ def test_import_cert_put_error_surfaces(monkeypatch):
 def _real_chain():
     """A leaf cert + an issuing CA cert (both self-signed for the test). Returns
     (fullchain_pem, chain_pem, leaf_cn, ca_cn, privkey)."""
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        from cryptography.x509.oid import NameOID
-        import datetime
-    except Exception:
-        pytest.skip("cryptography not installed")
+    # cryptography is a declared requirement: a missing install fails, never skips.
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    import datetime
     now = datetime.datetime.utcnow()
     leaf_cn, ca_cn = "leaf.example.com", "ISRG Root X1"
 
@@ -369,14 +365,12 @@ def _le_chain(root_cn="ISRG Root X1"):
     subject=R3 / issuer=<root_cn> so it is NOT self-signed by name, which is the
     signal ``_missing_root_pem`` keys on. Returns
     (fullchain_pem, chain_pem, intermediate_pem, root_cn, leaf_privkey)."""
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        from cryptography.x509.oid import NameOID
-        import datetime
-    except Exception:
-        pytest.skip("cryptography not installed")
+    # cryptography is a declared requirement: a missing install fails, never skips.
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    import datetime
     now = datetime.datetime.utcnow()
 
     def _cert(subj_cn, iss_cn, key):
@@ -527,9 +521,66 @@ def test_ensure_trust_list_skips_and_enables_existing(monkeypatch):
     assert not any(c.args[0] == "POST" for c in mock_client._request.call_args_list)
 
 
+@pytest.mark.parametrize("listed, reported", [
+    ({"enabled": True}, True), ({"enabled": False}, False), ({}, None),
+    ({"enabled": "yes"}, None)])
+def test_ensure_trust_list_reports_a_failed_enable(monkeypatch, listed, reported):
+    """The client reports a failed PATCH as an ERROR dict, not an exception, so
+    the result must say the enable failed (it explains the PUT's 422). A failed
+    PATCH changes nothing, so ``enabled`` is the state the GET reported, or
+    None when the GET did not say: never False for an entry already enabled."""
+    monkeypatch.setenv("LM_CPPM_P12_HOST", "127.0.0.1")
+    mock_client = MagicMock(spec=CPPMClient)
+    fullchain, _key, leaf_cn, ca_cn, _ = _real_chain()
+    q = _ctl_queries(mock_client, ctl_items=[{"id": 42, "subject_common_name": ca_cn, **listed}])
+    mock_client._request.return_value = {"status": "ERROR", "message": "HTTP 403"}
+
+    results = q._ensure_trust_list_cas(fullchain, "")
+
+    assert results[0]["action"] == "enable-failed"
+    assert results[0]["enabled"] is reported
+    assert results[0]["message"] == "enable failed: HTTP 403"
+
+
+def test_ensure_trust_list_entry_without_id_is_not_reported_enabled(monkeypatch):
+    """No id means no PATCH ran, so the entry must not claim to be enabled."""
+    monkeypatch.setenv("LM_CPPM_P12_HOST", "127.0.0.1")
+    mock_client = MagicMock(spec=CPPMClient)
+    fullchain, _key, leaf_cn, ca_cn, _ = _real_chain()
+    q = _ctl_queries(mock_client, ctl_items=[{"subject_common_name": ca_cn},
+                                             {"subject_common_name": "Other CA", "enabled": False}])
+
+    results = q._ensure_trust_list_cas(fullchain, "")
+
+    assert results[0]["action"] == "enable-not-attempted"
+    assert results[0]["enabled"] is None and "no id" in results[0]["message"]
+    mock_client._request.assert_not_called()
+
+
+@pytest.mark.parametrize("reply,action", [
+    ({"id": 9, "subject_common_name": "x"}, "added"),          # ClearPass returns the created object
+    ({"status": "ERROR", "message": "HTTP 422 bad cert"}, "error"),
+    (None, "error"),                                          # no JSON reply
+])
+def test_ensure_trust_list_post_outcome(monkeypatch, reply, action):
+    """A created entry (no "status" key) is "added"; any other failure is an error."""
+    monkeypatch.setenv("LM_CPPM_P12_HOST", "127.0.0.1")
+    mock_client = MagicMock(spec=CPPMClient)
+    q = _ctl_queries(mock_client, ctl_items=[])
+    mock_client._request.return_value = reply
+    fullchain, _key, leaf_cn, ca_cn, _ = _real_chain()
+
+    results = q._ensure_trust_list_cas(fullchain, "")
+
+    assert results[0]["action"] == action
+    if action == "added":
+        assert results[0]["status"] == "SUCCESS"
+
+
 def test_ensure_trust_list_duplicate_conflict_is_fine(monkeypatch):
     """A POST that returns 'already exists' (CA present under a usage we didn't
-    match on GET) is treated as already-trusted, not an error."""
+    match on GET) is not an error, but no enable was sent for it, so it is not
+    reported as already-trusted (enabled) either."""
     monkeypatch.setenv("LM_CPPM_P12_HOST", "127.0.0.1")
     mock_client = MagicMock(spec=CPPMClient)
     q = _ctl_queries(mock_client, ctl_items=[])
@@ -540,7 +591,8 @@ def test_ensure_trust_list_duplicate_conflict_is_fine(monkeypatch):
 
     results = q._ensure_trust_list_cas(fullchain, "")
 
-    assert results[0]["action"] == "already-trusted"
+    assert results[0]["action"] == "enable-not-attempted"
+    assert results[0]["enabled"] is None and "already exists" in results[0]["message"]
 
 
 def test_ensure_trust_list_blind_post_when_get_fails(monkeypatch):
