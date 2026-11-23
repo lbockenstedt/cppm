@@ -46,3 +46,15 @@ def test_requires_a_secret_and_subnets():
     assert q.sync_network_devices("dxp", "DXP", ["10.0.0.0/8"])["status"] == "ERROR"
     assert q.sync_network_devices("dxp", "DXP", [], radius_secret="r")["status"] == "ERROR"
     assert calls == []
+
+
+def test_a_null_json_page_aborts_the_sync_instead_of_ending_the_list():
+    """A later page whose JSON body is null must not read as the end of the list
+    (which would re-create devices listed on the pages after it)."""
+    client = MagicMock(spec=CPPMClient)
+    full = [{"id": i, "name": f"other-{i}", "description": ""} for i in range(1000)]
+    pages = iter([{"_embedded": {"items": full}}, None])
+    client._request.side_effect = lambda method, path, **kw: next(pages) if method == "GET" else {"id": 1}
+    res = CPPMQueries(client).sync_network_devices("dxp", "DXP", ["10.0.0.0/8"], radius_secret="r")
+    assert res["status"] == "ERROR"
+    assert [c for c in client._request.call_args_list if c.args[0] != "GET"] == []
