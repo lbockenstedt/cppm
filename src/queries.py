@@ -5,7 +5,7 @@ endpoint inventory search, tenant tagging/sync, and certificate installation,
 normalising ClearPass's varied field names into stable dictionaries.
 """
 # Type hints only; they document the shapes of values passed around.
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 # Low-level authenticated REST client for ClearPass.
 from client import CPPMClient
 # datetime for timestamps, json for payloads, logging for diagnostics, re for parsing.
@@ -42,6 +42,24 @@ def _nas_name(s: dict) -> str:
     return (s.get("nas_name") or s.get("nasname") or s.get("nasidentifier")
             or s.get("nas_identifier") or s.get("nas-identifier")
             or s.get("nasipaddress") or "")
+
+
+def _calling_station(s: dict) -> str:
+    """Caller (endpoint) MAC as ClearPass reports it on a ``/api/session`` record.
+
+    ``callingstationid`` is the confirmed field (it is also the only one
+    ``/api/session`` can filter on); some ClearPass versions and older code use
+    ``callingstation``. Reading only ``callingstation`` returned an empty MAC
+    for every session on an appliance that sends ``callingstationid``."""
+    # Prefer the confirmed field, then the older spelling.
+    return s.get("callingstationid") or s.get("callingstation") or ""
+
+
+def _session_mac(s: dict) -> str:
+    """Endpoint MAC for a ``/api/session`` record: the calling station, or a
+    plain ``mac`` key when the record carries no calling station."""
+    # Calling-station fields first, then the generic key.
+    return _calling_station(s) or s.get("mac") or ""
 
 
 def _nas_port(s: dict) -> str:
@@ -251,11 +269,17 @@ def _missing_root_pem(ca_pems: list) -> Optional[str]:
     # An empty chain has no last cert to inspect.
     if not ca_pems:
         return None
-    # Parse the last cert of the chain; imported lazily as cryptography is optional.
+    # Parse the last cert of the chain. cryptography is in requirements.txt;
+    # the lazy import keeps a broken install from stopping the whole spoke.
     try:
         from cryptography import x509
+    except ImportError:
+        logger.warning("cryptography is not installed: cannot add a missing "
+                       "Let's Encrypt root to the CTL (re-run install.sh)")
+        return None
+    try:
         last = x509.load_pem_x509_certificate(ca_pems[-1].encode())
-    # Unparseable cert or missing library: leave the chain unchanged.
+    # Unparseable cert: leave the chain unchanged.
     except Exception:
         return None
     if last.issuer == last.subject:          # self-signed → root already present
@@ -294,11 +318,16 @@ def _ca_certs_to_trust(fullchain: str, chain: str) -> list:
     return cas
 
 
+def _is_error(reply: Any) -> bool:
+    """True when a CPPMClient reply is its ERROR envelope."""
+    return isinstance(reply, dict) and reply.get("status") == "ERROR"
+
+
 def _cert_subject_cn(pem: str) -> str:
     """Best-effort Common Name from a PEM cert, for idempotency matching +
     diagnostics. Returns ``""`` on any parse failure (the caller treats an
     empty CN as 'unknown' and still POSTs)."""
-    # Parse the PEM (lazy import; cryptography is optional) and read the first cert's CN.
+    # Parse the PEM (lazy import of the required cryptography) and read the first cert's CN.
     try:
         from cryptography import x509
         certs = x509.load_pem_x509_certificates(pem.encode())
@@ -361,6 +390,30 @@ class CPPMQueries:
         # All API calls go through this client.
         self.client = client
 
+    @staticmethod
+    def _reply_problem(result: Any) -> Optional[str]:
+        """Why a ClearPass read reply is a failure, or None when it is a
+        usable dict or list. An ERROR reply and a JSON body that is neither
+        (``null``, a number, a string) both fail: ``_items`` reads either as
+        an empty list, which would look like "nothing found"."""
+        if isinstance(result, dict) and result.get("status") == "ERROR":
+            return str(result.get("message") or "ClearPass API error")
+        if not isinstance(result, (dict, list)):
+            return "ClearPass returned no JSON object or list"
+        return None
+
+    @staticmethod
+    def _raise_on_error(result: Any, what: str) -> Any:
+        """Return ``result``, or raise RuntimeError when ``_reply_problem``
+        says it is a failure, so a caller never reports a failed ClearPass
+        call as "nothing found". The handlers turn the exception into an
+        ERROR envelope.
+        """
+        problem = CPPMQueries._reply_problem(result)
+        if problem:
+            raise RuntimeError(f"{what} failed: {problem}")
+        return result
+
     def _items(self, result: Any, key: str = "_embedded") -> List[Dict]:
         """Extracts item list from CPPM's HAL-style response."""
         # Dict responses: an error result has no items.
@@ -413,9 +466,9 @@ class CPPMQueries:
             sessions.append({
                 "id":               s.get("id", ""),
                 "username":         s.get("username", ""),
-                "mac":              s.get("callingstation", s.get("mac", "")),
+                "mac":              _session_mac(s),
                 "ip":               s.get("framedipaddress", ""),
-                "calling_station":  s.get("callingstation", ""),
+                "calling_station":  _calling_station(s),
                 "nas_name":         _nas_name(s),
                 "nas_port":         _nas_port(s),
                 "nas_port_type":    _nas_port_type(s),
@@ -550,7 +603,7 @@ class CPPMQueries:
             # Normalise each session that has a MAC address.
             items = self._items(result)
             for s in items:
-                mac = s.get("callingstation", s.get("mac", ""))
+                mac = _session_mac(s)
                 if not mac:
                     continue  # MAC-keyed downstream; nothing to ingest without one
                 # Keep only the fields the NetBox sink needs.
@@ -709,8 +762,11 @@ class CPPMQueries:
 
     def get_device_by_mac(self, mac: str) -> Optional[Dict[str, Any]]:
         """Look up an endpoint record in ClearPass by its MAC address."""
-        # Query endpoints filtered by exact MAC address.
-        result = self.client.query("/api/endpoint", params={"filter": json.dumps({"mac_address": mac}, separators=(",", ":"))})
+        # Query endpoints filtered by exact MAC address; a failed query raises
+        # (it is not "no such endpoint").
+        result = self._raise_on_error(
+            self.client.query("/api/endpoint", params={"filter": json.dumps({"mac_address": mac}, separators=(",", ":"))}),
+            "endpoint lookup by MAC")
         # Return the first match, or None when no endpoint has that MAC.
         items = self._items(result)
         return items[0] if items else None
@@ -919,7 +975,47 @@ class CPPMQueries:
         # Return all candidate IP values.
         return ips
 
-    def _build_ip_endpoint_map(self, target_ips: set) -> Dict[str, Dict[str, Any]]:
+    def _page_problem(self, res: Any, offset: int, limit: int,
+                      expected: Optional[int] = None) -> Optional[str]:
+        """Why one page of a full /api/endpoint scan cannot be trusted, or None.
+
+        A scan that must cover the whole inventory (the replace-scan, the
+        IP → endpoint map) treats these pages as a partial scan: an ERROR
+        reply; a body that is not a page of endpoints (not a dict with an
+        ``_embedded`` list or an ``items`` list); a count below the rows already
+        returned (e.g. a full page with ``count: 0``), which proves nothing about
+        where the inventory ends; a short page that ends before the reported
+        count; a full page with no integer count, after which more pages
+        cannot be ruled out; and a count that differs from ``expected`` (the
+        first page's), because offset paging over an inventory that changed
+        mid-scan can stop before pages the first count promised."""
+        # An ERROR reply, or a body that is not a page of items.
+        if isinstance(res, dict) and res.get("status") == "ERROR":
+            return f"endpoint list failed at offset {offset}: {res.get('message')}"
+        embedded = res.get("_embedded") if isinstance(res, dict) else None
+        if not ((isinstance(embedded, dict)
+                 and any(isinstance(v, list) for v in embedded.values()))
+                or (isinstance(res, dict) and isinstance(res.get("items"), list))):
+            return f"endpoint list at offset {offset} returned no item list"
+        # The page must reach the reported count, or carry one when full.
+        n = len(self._items(res))
+        count = res.get("count")
+        count = count if isinstance(count, int) and not isinstance(count, bool) else None
+        if count is not None and expected is not None and count != expected:
+            return (f"endpoint list count changed from {expected} to {count} "
+                    "mid-scan — cannot tell where the inventory ends")
+        if count is not None and count < offset + n:
+            return (f"endpoint list count {count} is below the {offset + n} "
+                    "rows returned — cannot tell where the inventory ends")
+        if n < limit and count is not None and offset + n < count:
+            return f"endpoint list ended at {offset + n} of {count}"
+        if n >= limit and count is None:
+            return (f"endpoint list at offset {offset} has no count — cannot "
+                    "tell whether more pages follow")
+        return None
+
+    def _build_ip_endpoint_map(self, target_ips: set
+                               ) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
         """Bounded paged scan of the endpoint inventory building IP → endpoint
         for the requested IPs. Used when a NetBox IP record has no MAC: the
         ClearPass ``ip_address`` filter (``_get_endpoint_by_ip``) only matches
@@ -928,56 +1024,72 @@ class CPPMQueries:
         reused and the endpoint tagged for the tenant.
 
         Stops early once every requested IP is resolved or ``SYNC_SCAN_CAP`` is
-        hit. Best-effort: a CPPM paging failure returns whatever resolved so far
-        (the sync then skips the unresolved IPs as before). Logs scanned-vs-total
-        so a cap hit (or a small inventory where the IP genuinely isn't present)
-        is distinguishable from a real miss."""
+        hit. Returns ``(resolved, problem)``: ``problem`` is None when the scan
+        covered the whole inventory (or resolved every IP), so an IP missing
+        from ``resolved`` is confirmed absent; otherwise it says why the scan
+        stopped early (a page ``_page_problem`` rejects, or the cap), and what
+        resolved so far is still returned. Logs scanned-vs-total so a cap hit
+        (or a small inventory where the IP genuinely isn't present) is
+        distinguishable from a real miss."""
         # Result map and the set of non-empty IPs still being looked for.
         resolved: Dict[str, Dict[str, Any]] = {}
         wanted = {str(ip).strip() for ip in target_ips if str(ip).strip()}
         if not wanted:
-            return resolved
+            return resolved, None
         # Paging state: scan cap, page size, offset, rows scanned and server total.
         cap = self.SYNC_SCAN_CAP
         limit = 1000
         offset = 0
         scanned = 0
         total = 0
+        problem: Optional[str] = f"scan capped at {cap} endpoints"
+        first_count: Optional[int] = None
         # Page through the inventory until the cap is reached.
         while scanned < cap:
             # Fetch one page of endpoints with the total count.
             ep_r = self.client.query("/api/endpoint", params={
                 "limit": limit, "offset": offset, "calculate_count": "true"})
-            # Paging failure: log and return what has been resolved so far.
-            if isinstance(ep_r, dict) and ep_r.get("status") == "ERROR":
-                logger.warning("endpoint IP-map scan failed: %s", ep_r.get("message"))
-                break
-            # An empty page means the inventory is exhausted.
-            items = self._items(ep_r)
-            if not items:
-                break
-            # Record the first endpoint seen for each wanted IP.
+            # Record the first endpoint seen for each wanted IP. Rows on a page
+            # _page_problem rejects (a short page ending before its count, an
+            # inconsistent count) are still real endpoints, so use them too.
+            page_problem = self._page_problem(ep_r, offset, limit, first_count)
+            items = self._items(ep_r) if isinstance(ep_r, dict) else []
             for ep in items:
                 for ip in self._endpoint_ips(ep):
                     if ip in wanted and ip not in resolved:
                         resolved[ip] = ep
-            # Advance the counters and remember the server total.
             scanned += len(items)
-            total = ep_r.get("count", total) if isinstance(ep_r, dict) else total
-            offset += limit
-            # Stop at the last page or once every wanted IP is resolved.
-            if len(items) < limit or offset >= total:
-                break
+            # Every wanted IP resolved: nothing is left to confirm absent.
             if all(ip in resolved for ip in wanted):
+                problem = None
+                break
+            # A page that cannot be trusted: stop, keeping what resolved so far.
+            if page_problem:
+                logger.warning("endpoint IP-map scan failed: %s", page_problem)
+                problem = page_problem
+                break
+            # An empty page means the inventory is exhausted.
+            if not items:
+                problem = None
+                break
+            # Remember the server total.
+            count = ep_r.get("count")
+            total = count if isinstance(count, int) and not isinstance(count, bool) else total
+            if first_count is None and isinstance(count, int) and not isinstance(count, bool):
+                first_count = count
+            offset += limit
+            # Stop at the last page.
+            if len(items) < limit or offset >= total:
+                problem = None
                 break
         # Log coverage so a cap hit can be told apart from a genuine miss.
         logger.info("endpoint IP-map scan: scanned %d of %d endpoints (cap %d, %s); "
                     "resolved %d of %d wanted IPs",
                     scanned, total, cap,
-                    "CAPPED — raise SYNC_SCAN_CAP" if scanned >= cap else "complete",
+                    f"INCOMPLETE: {problem}" if problem else "complete",
                     len(resolved), len(wanted))
-        # Return the IP-to-endpoint map.
-        return resolved
+        # Return the IP-to-endpoint map and why it is incomplete, if it is.
+        return resolved, problem
 
     def _build_mac_endpoint_map(self, target_macs: set) -> Dict[str, Dict[str, Any]]:
         """Bounded paged scan of the endpoint inventory building normalized
@@ -1081,11 +1193,8 @@ class CPPMQueries:
                 ip = (s.get("framedipaddress") or "").strip()
                 if not ip or ip not in wanted or ip in resolved:
                     continue
-                # ``callingstationid`` is the confirmed /api/session field for
-                # the caller (endpoint) MAC; some ClearPass versions / the older
-                # access-tracker code use ``callingstation`` / a ``mac`` key, so
-                # accept all three.
-                mac_raw = s.get("callingstationid") or s.get("callingstation") or s.get("mac") or ""
+                # The session's endpoint MAC, whichever field carries it.
+                mac_raw = _session_mac(s)
                 # Keep the normalised MAC for this IP when the session carried one.
                 mac = self._norm_mac(mac_raw)
                 if mac:
@@ -1112,8 +1221,14 @@ class CPPMQueries:
                          tenant_id: str, tenant_name: str,
                          source: str,
                          ip_map: Optional[Dict[str, Dict[str, Any]]] = None,
-                         mac_map: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
+                         mac_map: Optional[Dict[str, Dict[str, Any]]] = None,
+                         matched_ids: Optional[set] = None) -> str:
         """Upsert one endpoint. Returns 'pushed' | 'skipped' | 'error'.
+
+        ``matched_ids`` collects the id of every existing endpoint this record
+        resolved to, whether or not the PUT then succeeds: the replace-scan
+        keeps those, because an IP-only record resolved to an endpoint keyed
+        by a MAC the batch does not carry.
 
         Keyed on MAC (authoritative); falls back to IP lookup when MAC is empty.
         Existing endpoints are PUT-merged (so profiler-derived attributes are
@@ -1171,6 +1286,8 @@ class CPPMQueries:
         if existing:
             # Without an id the endpoint cannot be updated.
             ep_id = existing.get("id")
+            if ep_id and matched_ids is not None:
+                matched_ids.add(str(ep_id))
             if not ep_id:
                 return "error"
             # Merge tenant tags over the current attributes and make every value a string.
@@ -1288,13 +1405,19 @@ class CPPMQueries:
         return True
 
     def _remove_absent_tagged(self, tenant_id: str, batch_keys: set,
-                              allow_mass_remove: bool = False) -> int:
+                              allow_mass_remove: bool = False,
+                              keep_ids: Optional[set] = None,
+                              keep_ips: Optional[set] = None) -> Tuple[int, List[str]]:
         """Delete endpoints tagged with this tenant whose key is not in the batch.
 
         Pages through /api/endpoint and filters client-side by the tenant
         attribute (ClearPass's filter support for arbitrary attributes is
         inconsistent across versions, so a client-side scan is the reliable
-        path). Returns the number deleted.
+        path). Returns ``(removed, failed)``: the number deleted, and one
+        ``"<id>: <reason>"`` entry per DELETE that failed (an ERROR or non-dict
+        reply, or a raised error), so the caller can report ERROR for stale
+        endpoints that are still in ClearPass. One failed DELETE does not stop
+        the others.
 
         SAFETY: this DELETEs every tenant-tagged endpoint whose key is absent
         from ``batch_keys``. An empty/truncated/failed batch would therefore
@@ -1309,7 +1432,19 @@ class CPPMQueries:
         ``allow_mass_remove`` skips guard 2 only, for a one-off sync an operator
         has confirmed (the tenant's IPAM data really did shrink). Guard 1 always
         applies.
+
+        ``keep_ids`` are endpoints this sync resolved a batch record to (an
+        IP-only record matched to an endpoint keyed by its MAC); they are in
+        the batch even though their key is not. ``keep_ips`` are the IPs of
+        IP-only records that resolved to no endpoint this pass (the lookup
+        failed or found nothing): an endpoint carrying one of them may be that
+        record's, so it is kept rather than deleted on a failed lookup. A page
+        that fails to load, is not a page of endpoints, or ends the list before
+        its reported count aborts the scan with nothing deleted: guard 2 is
+        only meaningful over the whole tagged set.
         """
+        keep_ids = keep_ids or set()
+        keep_ips = keep_ips or set()
         # Guard 1: an empty batch means the upstream produced no endpoints
         # (empty/truncated/failed). Reconciling against nothing would delete
         # the whole tagged inventory — refuse.
@@ -1326,17 +1461,24 @@ class CPPMQueries:
         to_delete: List[str] = []  # endpoint ids
         limit = 1000
         offset = 0
+        first_count: Optional[int] = None
         # Page through the whole endpoint inventory.
         while True:
             # Fetch one page of endpoints with the total count.
             res = self.client.query("/api/endpoint", params={
                 "limit": limit, "offset": offset, "calculate_count": "true"})
-            # Paging failure: log and stop scanning (deletions are then based on what was seen).
-            if isinstance(res, dict) and res.get("status") == "ERROR":
-                logger.warning("replace-scan list failed: %s", res.get("message"))
-                break
-            # An empty page means the inventory is exhausted.
+            # A page that cannot be trusted (failed, not a page, short of its
+            # count, or full with no count) leaves part of the inventory
+            # unscanned: abort before any DELETE. A partial tally would also
+            # let guard 2 pass on a removal it would refuse over the whole set.
+            page_problem = self._page_problem(res, offset, limit, first_count)
+            if page_problem:
+                raise ReplaceScanAborted(f"{page_problem} — nothing removed")
             items = self._items(res)
+            count = res.get("count")
+            count = count if isinstance(count, int) and not isinstance(count, bool) else None
+            if first_count is None:
+                first_count = count
             if not items:
                 break
             # Only endpoints tagged with this tenant are candidates for removal.
@@ -1351,7 +1493,8 @@ class CPPMQueries:
                 ip = ip_val.strip() if isinstance(ip_val, str) else ""
                 key = mac or f"ip:{ip}"
                 # Endpoints still present in the batch are kept.
-                if key in batch_keys:
+                if (key in batch_keys or str(ep.get("id")) in keep_ids
+                        or (keep_ips and self._endpoint_ips(ep) & keep_ips)):
                     continue
                 # Endpoints without an id cannot be deleted; otherwise queue it for removal.
                 ep_id = ep.get("id")
@@ -1359,9 +1502,8 @@ class CPPMQueries:
                     continue
                 to_delete.append(ep_id)
             # Advance to the next page; stop at the last page.
-            count = res.get("count", 0) if isinstance(res, dict) else 0
             offset += limit
-            if len(items) < limit or offset >= count:
+            if len(items) < limit or count is None or offset >= count:
                 break
 
         # Guard 2: refuse a removal that would take out more than half of the
@@ -1374,17 +1516,23 @@ class CPPMQueries:
                 f"{len(to_delete)} of {tagged_total} tagged endpoints (>50%) — "
                 "likely a truncated/failed batch; refusing to mass-delete")
 
-        # Pass 2: delete each queued endpoint, counting successes and logging failures.
+        # Pass 2: delete each queued endpoint, counting successes and
+        # collecting failures (ERROR reply, non-dict reply or a raised error).
         removed = 0
+        failed: List[str] = []
         for ep_id in to_delete:
-            d = self.client._request("DELETE", f"/api/endpoint/{ep_id}")
+            try:
+                d = self.client._request("DELETE", f"/api/endpoint/{ep_id}")
+            except Exception as e:
+                d = {"status": "ERROR", "message": str(e)}
             if isinstance(d, dict) and d.get("status") != "ERROR":
                 removed += 1
-            else:
-                logger.warning("endpoint DELETE %s failed: %s", ep_id,
-                               d.get("message") if isinstance(d, dict) else d)
-        # Number of endpoints actually removed.
-        return removed
+                continue
+            reason = d.get("message") if isinstance(d, dict) else d
+            logger.warning("endpoint DELETE %s failed: %s", ep_id, reason)
+            failed.append(f"{ep_id}: {reason}")
+        # Endpoints actually removed, and the ones still in ClearPass.
+        return removed, failed
 
     def sync_endpoints(self, tenant_id: str, tenant_name: str,
                        source: str, endpoints: List[Dict[str, Any]],
@@ -1455,14 +1603,23 @@ class CPPMQueries:
         # batch-level map is the attribute-based fallback (``IP Address`` etc.)
         # built once so we don't re-scan the inventory per record.
         # Build the IP map; a failure means only the exact ip_address filter is used.
+        # ``ip_map_problem`` is None only when the map covered the whole
+        # inventory, so an IP-only record it did not resolve is confirmed
+        # absent (skipped); otherwise such a record is unknown (an error).
         ip_map: Optional[Dict[str, Dict[str, Any]]] = None
+        ip_map_problem: Optional[str] = None
         ip_only = {ip for _, mac, ip, _ in batch if not mac and ip}
         if ip_only:
             try:
-                ip_map = self._build_ip_endpoint_map(ip_only)
+                ip_map, ip_map_problem = self._build_ip_endpoint_map(ip_only)
                 # Count how many IP-only records were resolved and log a warning when none were.
                 resolved_n = len({ip for ip in ip_only if ip in ip_map})
-                if ip_only and resolved_n == 0:
+                if ip_map_problem:
+                    logger.warning("endpoint sync tenant=%s IP→endpoint map incomplete "
+                                   "(%s): resolved %d of %d IP-only records; the rest "
+                                   "are reported as errors, not skipped",
+                                   tenant_id, ip_map_problem, resolved_n, len(ip_only))
+                elif resolved_n == 0:
                     logger.warning("endpoint sync tenant=%s: IP→endpoint map resolved "
                                    "0 of %d IP-only records — ClearPass has no endpoint "
                                    "carrying any of these IPs, so they will be skipped "
@@ -1481,6 +1638,7 @@ class CPPMQueries:
                                "(falling back to exact ip_address filter only)",
                                tenant_id, e)
                 ip_map = None
+                ip_map_problem = f"IP-map build failed: {e}"
 
         # Fallback MAC source for IP-only records the endpoint inventory did NOT
         # resolve: a live ClearPass session (Access Tracker) whose
@@ -1490,8 +1648,17 @@ class CPPMQueries:
         # typical 802.1X+DHCP sessions don't carry framedipaddress, so this often
         # resolves 0 — logged so it's distinguishable from a silent skip.
         # IPs still without an endpoint; try borrowing a MAC from live sessions.
+        # Only after a complete IP map: with a partial one, the IP may sit on an
+        # endpoint the scan never reached, and a borrowed MAC would skip the
+        # exact IP lookup and the keep-protection below, so the upsert could
+        # create a second endpoint and the replace-scan delete the real one.
+        # Those records stay IP-only and are reported as unresolved instead.
         unresolved = ip_only - set(ip_map or {})
-        if unresolved:
+        if unresolved and ip_map_problem:
+            logger.warning("endpoint sync tenant=%s: session MAC fallback skipped for "
+                           "%d unresolved IP-only record(s), endpoint lookup "
+                           "incomplete (%s)", tenant_id, len(unresolved), ip_map_problem)
+        elif unresolved:
             try:
                 # Build the session map and log how many MACs were borrowed.
                 session_mac_map = self._build_session_ip_mac_map(unresolved)
@@ -1524,6 +1691,11 @@ class CPPMQueries:
         # Per-outcome counters, error messages and details of skipped records.
         pushed = errors = skipped = 0
         err_msgs: List[str] = []
+        # Existing endpoints the batch resolved to, and IPs of IP-only records
+        # that resolved to none; the replace-scan keeps both.
+        matched_ids: set = set()
+        unresolved_ips: set = set()
+        lookup_incomplete: List[str] = []
         skipped_details: List[Dict[str, Any]] = []
         # First sync carrying a role override: make sure LM_Role is in the dictionary.
         if not self._role_attr_ready and any(str(r.get("nac_role") or "").strip() for _, _, _, r in batch):
@@ -1533,13 +1705,21 @@ class CPPMQueries:
                 logger.warning("ensure %s attribute failed: %s", self.ROLE_ATTR, e)
         # Upsert every batch record; one failure must not stop the rest.
         for key, mac, ip, rec in batch:
+            # This record's own match: two records may resolve to one endpoint.
+            rec_matched: set = set()
             try:
                 outcome = self._upsert_endpoint(mac, ip, rec, tenant_id,
                                                  tenant_name, source,
-                                                 ip_map=ip_map, mac_map=mac_map)
+                                                 ip_map=ip_map, mac_map=mac_map,
+                                                 matched_ids=rec_matched)
                 # Tally the outcome reported by the upsert.
                 if outcome == "pushed":
                     pushed += 1
+                # An IP-only record that matched nothing while the IP map was
+                # incomplete may still have an endpoint: unknown, not skipped.
+                elif outcome == "skipped" and not mac and ip and ip_map_problem:
+                    errors += 1
+                    lookup_incomplete.append(ip)
                 elif outcome == "skipped":
                     skipped += 1
                     # _upsert_endpoint already logged the per-record reason; capture
@@ -1558,13 +1738,30 @@ class CPPMQueries:
             except Exception as e:
                 errors += 1
                 err_msgs.append(f"{key}: {e}")
+            # An IP-only record that matched no endpoint (none found, or the
+            # lookup failed): its endpoint, if any, is unknown, so keep them all.
+            matched_ids |= rec_matched
+            if not mac and not rec_matched:
+                unresolved_ips.add(ip)
+        # One summary line for the records the incomplete IP map left unknown.
+        if lookup_incomplete:
+            err_msgs.append(f"{len(lookup_incomplete)} IP-only record(s) unresolved, "
+                            f"endpoint lookup incomplete ({ip_map_problem}): "
+                            + ", ".join(lookup_incomplete[:5]))
 
         # Replace mode: remove tenant-tagged endpoints that are no longer in the batch.
         removed = 0
         if replace:
             try:
-                removed = self._remove_absent_tagged(
-                    tenant_id, batch_keys, allow_mass_remove=allow_mass_remove)
+                removed, failed = self._remove_absent_tagged(
+                    tenant_id, batch_keys, allow_mass_remove=allow_mass_remove,
+                    keep_ids=matched_ids, keep_ips=unresolved_ips)
+                # A stale endpoint whose DELETE failed is still in ClearPass:
+                # count each one as an error so the sync reports ERROR.
+                if failed:
+                    errors += len(failed)
+                    err_msgs.append(f"stale delete failed for {len(failed)} "
+                                    f"endpoint(s): " + "; ".join(failed[:3]))
             except ReplaceScanAborted as e:
                 # Deliberate safety abort (empty/runaway batch) — count it as an
                 # error so the sync reports ERROR rather than a silent success
@@ -1573,9 +1770,13 @@ class CPPMQueries:
                 err_msgs.append(f"replace-scan aborted: {e}")
                 logger.error("endpoint sync tenant=%s replace-scan aborted: %s",
                              tenant_id, e)
-            # Other replace-scan failures are reported but do not mark the sync as failed.
+            # Any other replace-scan failure also left stale endpoints in place,
+            # so the sync did not finish its job: report ERROR, not SUCCESS.
             except Exception as e:
+                errors += 1
                 err_msgs.append(f"replace-scan: {e}")
+                logger.error("endpoint sync tenant=%s replace-scan failed: %s",
+                             tenant_id, e)
 
         # Log a one-line summary of every skipped record.
         if skipped_details:
@@ -1635,7 +1836,8 @@ class CPPMQueries:
         # Try the server-side callingstationid filter first.
         result = _query_filtered("callingstationid", norm) if norm else None
         used_fallback = False
-        if isinstance(result, dict) and result.get("status") == "ERROR":
+        filter_problem = self._reply_problem(result) if norm else None
+        if filter_problem:
             # Server filter rejected (e.g. field not filterable on this ClearPass
             # build) → bounded client-side scan so we still return matches.
             used_fallback = True
@@ -1648,17 +1850,19 @@ class CPPMQueries:
                 # Fetch one page of sessions.
                 r = self.client.query("/api/session", params={
                     "limit": page, "offset": offset, "calculate_count": "true"})
-                # Stop on API error or an empty page.
-                if isinstance(r, dict) and r.get("status") == "ERROR":
-                    break
+                # Both lookups failed: report it, not "no sessions".
+                scan_problem = self._reply_problem(r)
+                if scan_problem:
+                    return {"status": "ERROR", "message": (
+                        f"session lookup failed: filter {filter_problem}; "
+                        f"scan at offset {offset}: {scan_problem}")}
+                # An empty page means there are no more sessions.
                 page_items = self._items(r)
                 if not page_items:
                     break
                 # Compare each session's MAC (hex only) with the requested one.
                 for s in page_items:
-                    s_hex = re.sub(r"[^0-9a-f]", "",
-                                   (s.get("callingstationid")
-                                    or s.get("callingstation") or "").lower())
+                    s_hex = re.sub(r"[^0-9a-f]", "", _calling_station(s).lower())
                     if mac_hex and s_hex == mac_hex:
                         items.append(s)
                         if len(items) >= limit:
@@ -1702,9 +1906,10 @@ class CPPMQueries:
 
     def get_user_sessions(self, username: str) -> List[Dict[str, Any]]:
         """Query active and historical sessions associated with a specific username."""
-        # Filter sessions by exact username and return the raw records.
+        # Filter sessions by exact username and return the raw records; a
+        # failed query raises rather than reading as "no sessions".
         result = self.client.query("/api/session", params={"filter": json.dumps({"username": username}, separators=(",", ":"))})
-        return self._items(result)
+        return self._items(self._raise_on_error(result, "user session query"))
 
     def get_auth_logs(self, start_time: str, end_time: str) -> List[Dict[str, Any]]:
         """Retrieve authentication session logs within an ISO timestamp window."""
@@ -1713,8 +1918,9 @@ class CPPMQueries:
             "/api/session",
             params={"filter": json.dumps({"acctstarttime": {"$gte": start_time, "$lte": end_time}}, separators=(",", ":"))},
         )
-        # Return the raw session records.
-        return self._items(result)
+        # Return the raw session records; a failed query raises rather than
+        # reading as "no logs".
+        return self._items(self._raise_on_error(result, "auth log query"))
 
     def _endpoint_search_result(self, ep: Dict[str, Any]) -> Dict[str, Any]:
         """Normalise a ClearPass endpoint into a global-search result."""
@@ -1796,8 +2002,13 @@ class CPPMQueries:
           - `tenant_id` absent + `is_admin` False → empty (never leak another
             tenant's sessions/endpoints).
 
-        Each sub-search (endpoints, sessions) is wrapped in its own try/except
-        so a failure in one doesn't drop the other.
+        A failed ClearPass call in a sub-search (endpoints, sessions) is
+        reported, never read as "no matches": the matches already found are
+        returned with one ``{"type": "error"}`` row per failed sub-search,
+        which the hub's global search shows and marks the leg degraded. With
+        no match to return the reply is ERROR. A failed endpoint scan leaves
+        the session → tenant join incomplete, so a scoped search then drops
+        (never leaks) the sessions it cannot place.
         """
         # Normalise the query; an empty query returns no results.
         q = query.strip().lower()
@@ -1817,6 +2028,8 @@ class CPPMQueries:
         # MAC → NetBox_Tenant_ID map, populated from the endpoint scan so
         # sessions can be joined to a tenant (sessions carry no tenant attr).
         mac_to_tenant: Dict[str, str] = {}
+        # Why each failed sub-search failed; each becomes an error row.
+        failures: List[str] = []
 
         def _ep_tenant(ep: Dict[str, Any]) -> str:
             """Return the tenant id tagged on an endpoint, or "" when untagged."""
@@ -1828,6 +2041,12 @@ class CPPMQueries:
             # Exact endpoint lookup (MAC / IP) — precise & cheap.
             for filter_def in [{"mac_address": q}, {"ip_address": q}]:
                 ep_r = self.client.query("/api/endpoint", params={"filter": json.dumps(filter_def, separators=(",", ":")), "limit": 10})
+                # Best-effort fast path: the query text need not be a valid MAC
+                # or IP, so ClearPass may reject the filter. The substring scan
+                # below covers the same endpoints, and fails the search itself.
+                if isinstance(ep_r, dict) and ep_r.get("status") == "ERROR":
+                    logger.debug("endpoint exact lookup %s failed: %s", list(filter_def), ep_r.get("message"))
+                    continue
                 # Record each match's tenant, apply tenant scoping and de-duplicate by id.
                 for ep in self._items(ep_r):
                     mac = self._norm_mac(ep.get("mac_address", ""))
@@ -1850,10 +2069,8 @@ class CPPMQueries:
                 # Fetch one page of endpoints.
                 ep_r = self.client.query("/api/endpoint", params={
                     "limit": limit, "offset": offset, "calculate_count": "true"})
-                # Paging failure: log and stop the endpoint scan.
-                if isinstance(ep_r, dict) and ep_r.get("status") == "ERROR":
-                    logger.warning("endpoint substring scan failed: %s", ep_r.get("message"))
-                    break
+                # Paging failure: fail the search (handled below).
+                self._raise_on_error(ep_r, "endpoint substring scan")
                 # An empty page means the inventory is exhausted.
                 items = self._items(ep_r)
                 if not items:
@@ -1881,9 +2098,11 @@ class CPPMQueries:
                 offset += limit
                 if len(items) < limit or offset >= count:
                     break
-        # Endpoint search failure is logged so the session search still runs.
+        # Endpoint search failure is recorded; the session search still runs
+        # so its failure (if any) is reported too.
         except Exception as e:
             logger.error(f"CPPM endpoint search failed: {e}")
+            failures.append(f"endpoint search: {e}")
 
         # --- Active sessions (bounded) — substring by IP/MAC/user/NAS ------
         try:
@@ -1895,20 +2114,19 @@ class CPPMQueries:
                 # Fetch one page of sessions.
                 session_r = self.client.query("/api/session", params={
                     "limit": limit, "offset": offset, "calculate_count": "true"})
-                # Paging failure: log and stop the session scan.
-                if isinstance(session_r, dict) and session_r.get("status") == "ERROR":
-                    logger.warning("session substring scan failed: %s", session_r.get("message"))
-                    break
+                # Paging failure: fail the search (handled below).
+                self._raise_on_error(session_r, "session substring scan")
                 # An empty page means there are no more sessions.
                 items = self._items(session_r)
                 if not items:
                     break
                 # Text fields to search: username, IP, MAC and NAS name.
                 for s in items:
+                    smac_raw = _calling_station(s)
                     fields = [
                         s.get("username", ""),
                         s.get("framedipaddress", ""),
-                        s.get("callingstation", ""),
+                        smac_raw,
                         _nas_name(s),
                     ]
                     # Role names are searchable too.
@@ -1921,14 +2139,14 @@ class CPPMQueries:
                         # Separator-insensitive MAC match for callingstation.
                         q_hex = re.sub(r"[^0-9a-f]", "", q)
                         if q_hex:
-                            mac_hex = re.sub(r"[^0-9a-f]", "", (s.get("callingstation") or "").lower())
+                            mac_hex = re.sub(r"[^0-9a-f]", "", smac_raw.lower())
                             matched = q_hex in mac_hex
                     # Skip sessions that matched nothing.
                     if not matched:
                         continue
                     # Resolve the session's tenant by joining to its endpoint
                     # (sessions carry no tenant attribute of their own).
-                    smac = self._norm_mac(s.get("callingstation", ""))
+                    smac = self._norm_mac(smac_raw)
                     stenant = mac_to_tenant.get(smac, "")
                     if scoped and stenant != tenant_id:
                         # No endpoint, or endpoint's tenant doesn't match → drop
@@ -1940,7 +2158,7 @@ class CPPMQueries:
                         "type":     "session",
                         "name":     s.get("username", ""),
                         "ip":       s.get("framedipaddress", ""),
-                        "mac":      s.get("callingstation", ""),
+                        "mac":      smac_raw,
                         "nas":      _nas_name(s),
                         "role":     (roles or [""])[0] if isinstance(roles, list) else s.get("role", ""),
                         "tenant":   stenant,
@@ -1951,9 +2169,14 @@ class CPPMQueries:
                 offset += limit
                 if len(items) < limit or offset >= count:
                     break
-        # Session search failure is logged so endpoint results are still returned.
+        # Session search failure is recorded.
         except Exception as e:
             logger.error(f"CPPM session search failed: {e}")
+            failures.append(f"session search: {e}")
+
+        # A failed sub-search with no match to show: report ERROR, not "no matches".
+        if failures and not results:
+            return {"status": "ERROR", "message": "; ".join(failures)}
 
         # Deduplicate by id
         # Unique results and the keys already seen.
@@ -1965,20 +2188,28 @@ class CPPMQueries:
             if key not in seen:
                 seen.add(key)
                 unique.append(r)
-        # Return the de-duplicated results and their count.
-        return {"status": "SUCCESS", "results": unique, "count": len(unique)}
+        # Return the de-duplicated results and their count, then one error
+        # row per failed sub-search (after the de-duplication, which would
+        # merge them) so the partial result is never taken as complete.
+        count = len(unique)
+        unique.extend({"source": "cppm", "type": "error", "name": f} for f in failures)
+        return {"status": "SUCCESS", "results": unique, "count": count}
 
     def list_roles(self, prefix: str = "") -> List[Dict[str, Any]]:
         """Fetch every ClearPass role, optionally only names starting with ``prefix``.
 
         Pages through /api/role (ClearPass returns a small page by default).
+        A page that fails raises RuntimeError, so a failed or partial list is
+        never returned as the full one.
         """
+        # Accumulated roles and the paging position.
         roles: List[Dict[str, Any]] = []
         offset = 0
         page = 1000
+        # Page through the roles until a short page (or the 50k safety stop).
         while True:
-            items = self._items(self.client.query(
-                "/api/role", params={"limit": page, "offset": offset}))
+            items = self._items(self._raise_on_error(self.client.query(
+                "/api/role", params={"limit": page, "offset": offset}), "role list"))
             roles.extend(items)
             if len(items) < page or offset >= 50000:
                 break
@@ -2142,10 +2373,15 @@ class CPPMQueries:
             return []
 
         # One GET to index existing CTL entries by subject CN (best-effort —
-        # the list item's CN field name isn't documented, so try several).
+        # the list item's CN field name isn't documented, so try several),
+        # keeping each entry's id and the enabled state the GET reported.
         existing: Dict[str, Any] = {}
+        was_enabled: Dict[str, Optional[bool]] = {}
         try:
             lst = self.client.query("/api/cert-trust-list")
+            if _is_error(lst):
+                logger.warning("trust-list GET failed (%s) — proceeding with blind "
+                               "POST (no idempotency index)", lst.get("message"))
             for it in self._items(lst):
                 if not isinstance(it, dict):
                     continue
@@ -2154,6 +2390,8 @@ class CPPMQueries:
                 cn = str(cn).strip() if cn else ""
                 if cn:
                     existing[cn] = it.get("id")
+                    en = it.get("enabled")
+                    was_enabled[cn] = en if isinstance(en, bool) else None
         except Exception as e:
             logger.warning("trust-list GET failed (%s) — proceeding with blind "
                            "POST (no idempotency index)", e)
@@ -2165,18 +2403,38 @@ class CPPMQueries:
             cn = _cert_subject_cn(pem) or "<unknown>"
             if cn in existing:
                 # Already trusted — ensure it's enabled (PATCH), don't re-POST.
+                # "already-trusted" means present AND enabled by this PATCH;
+                # a failed or unsent enable gets its own action, because the
+                # PUT's 422 needs the CA enabled, not just present.
                 tid = existing.get(cn)
-                enabled = True
+                entry = {"ca": cn, "action": "already-trusted", "enabled": True}
                 if tid is not None:
+                    # _request reports most failures as an ERROR dict rather
+                    # than raising, so the reply is checked as well.
                     try:
-                        self.client._request(
+                        r = self.client._request(
                             "PATCH", f"/api/cert-trust-list/{tid}",
                             json={"enabled": True})
+                        failure = None
+                        if _is_error(r):
+                            failure = str(r.get("message") or "ClearPass API error")
+                        elif not isinstance(r, (dict, list)):
+                            failure = "no JSON reply"
                     except Exception as e:
-                        enabled = False
-                        logger.warning("trust-list PATCH-enable %s failed: %s", cn, e)
-                results.append({"ca": cn, "action": "already-trusted",
-                                "enabled": enabled})
+                        failure = str(e)
+                    # The enable failed: say so, so the PUT's 422 is explained.
+                    # The entry keeps the state the GET reported (None when
+                    # the GET did not say): a failed PATCH changes nothing.
+                    if failure is not None:
+                        logger.warning("trust-list PATCH-enable %s failed: %s", cn, failure)
+                        entry.update(action="enable-failed", enabled=was_enabled.get(cn),
+                                     message=f"enable failed: {failure}"[:160])
+                else:
+                    # No id to PATCH: report the state the GET reported, if any.
+                    logger.warning("trust-list entry %s has no id; enable not attempted", cn)
+                    entry.update(action="enable-not-attempted", enabled=was_enabled.get(cn),
+                                 message="entry has no id; enable not attempted")
+                results.append(entry)
                 continue
             # Not yet trusted: POST it to the trust list as enabled.
             try:
@@ -2190,19 +2448,26 @@ class CPPMQueries:
                 results.append({"ca": cn, "action": "error",
                                 "message": str(e)[:160]})
                 continue
-            # Pull status and message out of the response.
-            st = (r or {}).get("status", "ERROR") if isinstance(r, dict) else "ERROR"
-            msg = str((r or {}).get("message", "") or "") if isinstance(r, dict) else ""
-            # A duplicate/conflict (CA already trusted under a usage we didn't
-            # match) is fine — the CA is present, which is all the PUT requires.
+            # A created entry comes back as the object itself (no "status"),
+            # so only an ERROR dict or a non-JSON reply is a failure.
+            st = "ERROR" if _is_error(r) or not isinstance(r, (dict, list)) else "SUCCESS"
+            msg = str(r.get("message", "") or "") if isinstance(r, dict) else ""
+            # A duplicate/conflict: the CA is present under an entry the GET
+            # did not match, so no id to enable and its state is unknown. Not
+            # an error, but not confirmed enabled either.
             low = msg.lower()
             if st == "ERROR" and any(k in low for k in
                                      ("exist", "duplicate", "already")):
-                results.append({"ca": cn, "action": "already-trusted"})
+                logger.warning("trust-list POST %s: already present; enable not attempted", cn)
+                results.append({"ca": cn, "action": "enable-not-attempted", "enabled": None,
+                                "message": f"already present ({msg}); enable not attempted"[:160]})
+            elif st == "ERROR":
+                # Any other failure is an error, never "added".
+                logger.warning("trust-list POST %s failed: %s", cn, msg or "no JSON reply")
+                results.append({"ca": cn, "action": "error",
+                                "message": (msg or "no JSON reply")[:160]})
             else:
-                # Any other response is recorded as "added" with its status and message.
-                results.append({"ca": cn, "action": "added", "status": st,
-                                "message": msg[:160]})
+                results.append({"ca": cn, "action": "added", "status": st})
         # Per-CA outcomes for the caller's log/response.
         return results
 
@@ -2391,6 +2656,11 @@ class CPPMQueries:
                                        params={"limit": 1000, "offset": offset})
             if isinstance(res, dict) and res.get("status") == "ERROR":
                 raise RuntimeError(res.get("message") or "network-device list failed")
+            # A JSON body that is not an object or list (e.g. null) would read
+            # as an empty last page and silently end the list early. (The
+            # client already reports a non-JSON or empty GET body as ERROR.)
+            if not isinstance(res, (dict, list)):
+                raise RuntimeError(f"network-device list returned no JSON at offset {offset}")
             # Add this page; a short page means the list is complete.
             page = self._items(res)
             out.extend(page)
